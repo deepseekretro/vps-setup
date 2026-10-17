@@ -532,6 +532,16 @@
 
     var tools = document.createElement('div');
     tools.className = 'pane-tools';
+    // This pane's own tab, sitting right above the terminal: in 宫格 / 分屏 you can
+    // see at a glance which terminal is which.  It is clickable (focus) and
+    // draggable (same gesture as the strip tab: re-order / go on the wall).
+    var paneTab = document.createElement('span');
+    paneTab.className = 'pane-tab';
+    var paneDot = document.createElement('span'); paneDot.className = 'dot';
+    var paneLabel = document.createElement('span'); paneLabel.className = 'plabel';
+    paneTab.append(paneDot, paneLabel);
+    paneTab.addEventListener('click', function (e) { e.stopPropagation(); activate(id); });
+    tools.appendChild(paneTab);
     var splitBtn = document.createElement('button');
     splitBtn.type = 'button';
     splitBtn.className = 'pane-tool split-tool';    // hidden in 宫格 / 分组 layouts
@@ -580,12 +590,14 @@
     var dot = document.createElement('span'); dot.className = 'dot';
     var label = document.createElement('span'); label.className = 'label';
     label.textContent = (opts.title && !opts.userTitled) ? opts.title : ('Tab ' + n);
+    paneLabel.textContent = label.textContent;           // same text above the pane
     var close = document.createElement('span'); close.className = 'close'; close.textContent = '×';
     close.title = '关闭终端';
     tabEl.append(dot, label, close);
 
     var t = {
       term: null, fit: null, pane: pane, tabEl: tabEl, labelEl: label,
+      paneTabEl: paneTab, paneLabelEl: paneLabel,
       n: n, alive: true, title: opts.title || '', userTitled: !!opts.userTitled,
       ocId: opts.ocId || null, _rt: null, upBtn: upBtn, attaching: false,
       cwd: '',                                        // filled in by the server
@@ -594,7 +606,8 @@
     tabEl.addEventListener('click', function (e) { if (e.target !== close) activate(id); });
     close.addEventListener('click', function (e) { e.stopPropagation(); closeTab(id); });
     tabbar.insertBefore(tabEl, tabMoreBtn);
-    wireTabDrag(t, id, close);
+    wireTabDrag(t.tabEl, t, id, close);                    // drag from the strip tab
+    wireTabDrag(paneTab, t, id, null);                     // …or from the tab above the pane
 
     // clicking anywhere inside a pane focuses it (matters in split view)
     pane.addEventListener('mousedown', function () {
@@ -737,6 +750,7 @@
     tabs.forEach(function (tt, tid) {
       tt.pane.classList.toggle('active', tid === id);
       tt.tabEl.classList.toggle('active', tid === id);
+      if (tt.paneTabEl) tt.paneTabEl.classList.toggle('active', tid === id);
     });
     if (layoutMode !== 'tabs' || !layoutTree) {
       syncPaneVisibility();                    // single / grid / grouped: focus decides
@@ -1289,17 +1303,22 @@
     toast('已把「' + (src.labelEl.textContent || '终端') + '」移到第 ' + stripIndex(id) + ' 位');
   }
 
-  function wireTabDrag(t, id, closeEl) {
-    t.tabEl.addEventListener('pointerdown', function (e) {
+  function wireTabDrag(handle, t, id, ignoreEl) {
+    handle.addEventListener('pointerdown', function (e) {
       if (e.button !== undefined && e.button !== 0) return;
-      if (e.target === closeEl || (closeEl && closeEl.contains(e.target))) return;
+      if (ignoreEl && (e.target === ignoreEl || ignoreEl.contains(e.target))) return;
+      if (e.target && e.target.closest && e.target.closest('.pane-tool')) return;
       var st = { x: e.clientX, y: e.clientY, active: false, drop: null };
+      function mark(on) {
+        t.tabEl.classList.toggle('dragging', on);
+        t.paneTabEl.classList.toggle('dragging', on);
+      }
       function move(ev) {
         if (!tabs.has(id)) { cleanup(); return; }
         if (!st.active) {
           if (Math.abs(ev.clientX - st.x) < 6 && Math.abs(ev.clientY - st.y) < 6) return;
           st.active = true;
-          t.tabEl.classList.add('dragging');
+          mark(true);
           showGhost(t, ev);
         }
         moveGhost(ev);
@@ -1307,10 +1326,10 @@
         if (dragGhost) dragGhost.act.textContent = dropHint(st.drop);
       }
       function cleanup() {
-        t.tabEl.removeEventListener('pointermove', move);
-        t.tabEl.removeEventListener('pointerup', up);
-        t.tabEl.removeEventListener('pointercancel', cancel);
-        t.tabEl.classList.remove('dragging');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', up);
+        handle.removeEventListener('pointercancel', cancel);
+        mark(false);
         clearDropZone();
         hideGhost();
       }
@@ -1662,8 +1681,16 @@
     var cands = [];
     tabs.forEach(function (t, id) {
       var inBar = !!allowed[id];
+      var onWall = (layoutMode === 'grid') && wallHas(id);
       t.tabEl.style.display = inBar ? '' : 'none';
-      t.tabEl.classList.toggle('on-wall', layoutMode === 'grid' && wallHas(id));
+      t.tabEl.classList.toggle('on-wall', onWall);
+      if (t.paneTabEl) {                              // the tab shown above the pane
+        t.paneTabEl.classList.toggle('on-wall', onWall);
+        t.paneTabEl.classList.toggle('active', id === activeId);
+        t.paneLabelEl.textContent = (onWall ? '▦ ' : '') + tabLabelOf(id);
+        t.paneTabEl.title = '这个终端的标签：点一下聚焦，拖动 = 换位置 / 上墙' +
+          (onWall ? '（已在宫格墙上）' : '');
+      }
       if (inBar) cands.push(id);
     });
 

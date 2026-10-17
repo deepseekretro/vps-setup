@@ -207,8 +207,7 @@
   .pane.on { display: flex; }              /* visibility (single mode: the focused pane) */
   .pane.active { /* focused pane; ring only applies inside a split */ }
 
-  /* ---- 宫格 layout: every terminal gets a grid cell (no tab switching) ---- */
-  #panes.grid-mode {
+  /* ---- 宫格 layout: every terminal gets a grid cell (no tab switching) ---- */  #panes.grid-mode {
     display: grid; gap: 10px; padding: 10px; overflow: auto;
     grid-auto-rows: minmax(140px, 1fr);
   }
@@ -222,6 +221,7 @@
     border-color: var(--accent); box-shadow: 0 0 0 1px rgba(25, 169, 123, .35);
   }
   #panes.grid-mode .pane-tools { padding-bottom: 4px; }
+  #panes.grid-mode .pane-tab { font-size: 11px; padding: 2px 7px; max-width: 55%; }
   /* no splitting in 宫格 / 分组: the layout itself decides where panes go */
   #panes.grid-mode .split-tool, #panes.group-mode .split-tool { display: none; }
   /* 宫格: this cell comes off the wall (the terminal itself stays open) */
@@ -296,6 +296,22 @@
     flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end;
     gap: 8px; padding-bottom: 6px;
   }
+  /* the tab of this pane, sitting right above the terminal */
+  .pane-tab {
+    display: flex; align-items: center; gap: 6px; margin-right: auto;
+    max-width: 62%; padding: 3px 9px; border-radius: 6px;
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+    border: 1px solid var(--border); background: var(--tab-bg);
+    cursor: grab; user-select: none; touch-action: pan-x;
+  }
+  .pane-tab .plabel { overflow: hidden; text-overflow: ellipsis; }
+  .pane-tab .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: 0 0 auto;
+  }
+  .pane-tab:hover { color: var(--text); border-color: var(--accent); }
+  .pane-tab.active { color: var(--text); border-color: var(--accent); }
+  .pane-tab.on-wall .plabel { color: var(--text); }
+  .pane-tab.dragging { opacity: .45; }
   .pane-tool {
     background: var(--tab-bg); border: 1px solid var(--border); color: var(--muted);
     border-radius: 7px; padding: 4px 10px; font-size: 12px; cursor: pointer;
