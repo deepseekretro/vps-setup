@@ -35,6 +35,16 @@ update_variables() {
     SSL_KEY="${SSL_CERT_DIR}/selfsigned.key"
     SSL_CRT="${SSL_CERT_DIR}/selfsigned.crt"
 
+    # OpenResty 增量配置（默认值；运行时由 detect_openresty_paths 按 nginx -V 修正）
+    OR_PREFIX="/usr/local/openresty/nginx"
+    OR_NGINX_BIN="${OR_PREFIX}/sbin/nginx"
+    OR_CONF_DIR="${OR_PREFIX}/conf"
+    OR_MAIN_CONF="${OR_CONF_DIR}/nginx.conf"
+    OR_DROPIN_DIR="${OR_CONF_DIR}/conf.d"
+    OR_DROPIN="${OR_DROPIN_DIR}/50-novnc.conf"
+    OR_MAIN_BAK="${OR_MAIN_CONF}.vps-setup.bak"
+    VNC_CONFIG_MARK="# Managed by vps-setup (vnc_desktop_setup.sh)"
+
     # lxpanel / pcmanfm / openbox（连带 lxde-common / lxsession / openbox-lxde-session）
     # 都是 lxde-core 的硬依赖，会随它一起装上，不必重复列出；
     # lxterminal 是「切换分辨率」工具双击时用的终端，lxappearance/lxde-icon-theme 是外观件。
@@ -659,8 +669,232 @@ install_edge_browser() {
     apt update; apt install -y --no-install-recommends microsoft-edge-stable
 }
 
+# -------------------------------------------------------
+# OpenResty 增量配置（不再整份覆盖 nginx.conf）
+#
+#   旧做法是 `cat > /etc/openresty/nginx.conf` 整份覆盖 —— 你原有的 server /
+#   upstream / webterm 等配置会被一起抹掉。现在改成增量：
+#     · 你的 nginx.conf 能不动就不动：只有它内部没有任何 conf.d include 时，
+#       才补插 1 行带标记的 include（插前自动备份，nginx -t 失败自动回滚）。
+#     · noVNC 站点的 server 块只写脚本自己的 conf.d/50-novnc.conf，可反复覆盖；
+#       删掉该文件 + reload 就等于卸载 noVNC 站点，与你其它配置互不影响。
+#     · 端口：优先 443；若已被别的 server 块占用就自动退到 8443，之后一直沿用。
+#     · 老版本（内联式）留下的 noVNC server 块会被摘出来放进 drop-in，
+#       你后来加在 nginx.conf 里的其它内容保持不变。
+#
+#   路径以 nginx -V 的 --prefix 为准（/etc/openresty 是 <prefix>/conf 的软链）。
+# -------------------------------------------------------
+
+detect_openresty_paths() {
+    local bin="/usr/local/openresty/nginx/sbin/nginx"
+    OR_PREFIX=""
+    if [ -x "${bin}" ]; then
+        OR_PREFIX=$(${bin} -V 2>&1 | tr ' ' '\n' | grep -m1 '^--prefix=' | cut -d= -f2)
+    fi
+    OR_PREFIX=${OR_PREFIX:-/usr/local/openresty/nginx}
+    OR_NGINX_BIN="${OR_PREFIX}/sbin/nginx"
+    [ -x "${OR_NGINX_BIN}" ] || OR_NGINX_BIN="$(command -v nginx 2>/dev/null || echo ${OR_PREFIX}/sbin/nginx)"
+    OR_CONF_DIR="${OR_PREFIX}/conf"
+    OR_MAIN_CONF="${OR_CONF_DIR}/nginx.conf"
+    # 注意：nginx 的相对 include 是按「配置文件所在目录」解析的（实测），
+    # 所以 drop-in 目录放在 nginx.conf 旁边，老版本写的 `include conf.d/*.conf;` 正好指到这里。
+    OR_DROPIN_DIR="${OR_CONF_DIR}/conf.d"
+    OR_DROPIN="${OR_DROPIN_DIR}/50-novnc.conf"
+    OR_MAIN_BAK="${OR_MAIN_CONF}.vps-setup.bak"
+}
+
+# 主配置里是否已经有会加载到我们 drop-in 目录的 include
+#   绝对路径直接用；相对路径按「配置文件所在目录」解析（nginx 实测行为），
+#   同时顺带用 prefix 也试一次（兼容不同实现），比较前用 readlink -f 归一化
+novnc_include_present() {
+    local inc cand dir
+    while IFS= read -r inc; do
+        inc=$(printf '%s' "${inc}" | sed -E 's/^[[:space:]]*include[[:space:]]+//; s/;[[:space:]]*$//')
+        [ -n "${inc}" ] || continue
+        if [ "${inc#/}" != "${inc}" ]; then
+            for cand in "${inc}"; do
+                dir=$(dirname "${cand}")
+                [ "$(readlink -f "${dir}" 2>/dev/null)" = "$(readlink -f "${OR_DROPIN_DIR}" 2>/dev/null)" ] && return 0
+            done
+        else
+            for cand in "${OR_CONF_DIR}/${inc}" "${OR_PREFIX}/${inc}"; do
+                dir=$(dirname "${cand}")
+                [ "$(readlink -f "${dir}" 2>/dev/null)" = "$(readlink -f "${OR_DROPIN_DIR}" 2>/dev/null)" ] && return 0
+            done
+        fi
+    done < <(grep -hE '^[[:space:]]*include[[:space:]]+' "${OR_MAIN_CONF}" 2>/dev/null)
+    return 1
+}
+
+# 端口是否已被「别人的」server 块占用（我们自己的 drop-in 不算；备份文件不算）
+#   注意：listen 可能和 server 写在同一行，也可能被注释掉 —— 先剥注释再匹配
+novnc_port_taken() {
+    local port="$1" f
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        [ "${f}" = "${OR_DROPIN}" ] && continue
+        [ -f "${f}" ] || continue
+        sed 's/#.*$//' "${f}" 2>/dev/null \
+            | grep -qE "(^|[^0-9a-zA-Z_])listen[[:space:]]+(\[::\]:)?${port}([[:space:];]|$)" && return 0
+    done < <(printf '%s\n' "${OR_MAIN_CONF}"; find "${OR_CONF_DIR}" -maxdepth 2 -name '*.conf' 2>/dev/null)
+    return 1
+}
+
+# 端口选择：已装过就沿用 drop-in 里的端口；否则优先 443，被占则 8443/9443/10443
+pick_novnc_port() {
+    if [ -n "${NOVNC_PORT:-}" ]; then echo "${NOVNC_PORT}"; return; fi
+    if [ -f "${OR_DROPIN}" ]; then
+        local cur
+        cur=$(grep -oE 'listen[[:space:]]+[0-9]+' "${OR_DROPIN}" 2>/dev/null | head -1 | grep -oE '[0-9]+')
+        [ -n "${cur}" ] && { echo "${cur}"; return; }
+    fi
+    local cand
+    for cand in 443 8443 9443 10443; do
+        novnc_port_taken "${cand}" && continue
+        echo "${cand}"; return
+    done
+    echo 8443
+}
+
+# 改主配置前只备份一次（同一次运行里回滚用同一份）
+backup_main_conf() {
+    [ -f "${OR_MAIN_BAK}" ] || cp -a "${OR_MAIN_CONF}" "${OR_MAIN_BAK}"
+}
+
+# 全新机器：没有 nginx.conf 时，写一份脚本自有的最小基底（noVNC 本体在 conf.d）
+write_minimal_openresty_conf() {
+    mkdir -p "${OR_CONF_DIR}" "${OR_DROPIN_DIR}"
+    cat > "${OR_MAIN_CONF}" <<EOF
+${VNC_CONFIG_MARK}
+# 本文件由脚本生成的「最小基底」：只加载 mime.types 与 conf.d/*.conf。
+# 你自己的 server / upstream 请放进 ${OR_DROPIN_DIR}/ 下的独立 .conf 文件，
+# 本脚本以后重跑不会再覆盖它们。
+user www-data;
+worker_processes auto;
+events { worker_connections 1024; }
+http {
+    include mime.types;
+    default_type application/octet-stream;
+    include ${OR_DROPIN_DIR}/*.conf;
+}
+EOF
+}
+
+# 已有 nginx.conf 但里面没有任何 conf.d include：在 http{} 开头补插 1 行（带标记）
+add_novnc_include() {
+    local f="${OR_MAIN_CONF}" tmp="${OR_MAIN_CONF}.vps-setup.new"
+    backup_main_conf
+    awk -v mark="    ${VNC_CONFIG_MARK} (增量插入：加载 conf.d 下的 noVNC 站点，删本行即可回收)" \
+        -v inc="    include ${OR_DROPIN_DIR}/*.conf;" '
+        { print }
+        !done && $0 ~ /^[[:space:]]*http[[:space:]]*\{/ {
+            print mark
+            print inc
+            done = 1
+        }
+    ' "${f}" > "${tmp}" && mv "${tmp}" "${f}"
+    grep -qF "${OR_DROPIN_DIR}/*.conf" "${f}" 2>/dev/null
+}
+
+# 老版本把 noVNC 的 server 块内联写在 nginx.conf 里：按花括号配对把它整块摘掉
+# （只摘含我们签名 rewrite 的那一块，其它 server 块原样保留）
+strip_legacy_novnc_block() {
+    local f="${OR_MAIN_CONF}" tmp="${OR_MAIN_CONF}.vps-setup.new"
+    grep -qE '^[[:space:]]*server[[:space:]]*\{' "${f}" 2>/dev/null || return 1
+    backup_main_conf
+    awk -v sig="rewrite ^/vnc(" '
+        !inblk && /^[[:space:]]*server[[:space:]]*\{/ { inblk=1; depth=0; buf=""; drop=0 }
+        inblk {
+            buf = buf $0 "\n"
+            s=$0; o=gsub(/\{/, "&", s); s=$0; c=gsub(/\}/, "&", s)
+            depth += o - c
+            if (depth <= 0) {
+                inblk=0
+                if (index(buf, sig) == 0) printf "%s", buf
+            }
+            next
+        }
+        { print }
+    ' "${f}" > "${tmp}" && mv "${tmp}" "${f}"
+    grep -qF 'rewrite ^/vnc(' "${f}" 2>/dev/null && return 1
+    return 0
+}
+
+# 写 noVNC 站点本体（脚本自有的 drop-in 文件，可反复覆盖）
+write_novnc_dropin() {
+    local port="$1" i ws=""
+    for ((i=1; i<=3; i++)); do
+        ws+="    location /websockify/${i} {
+        proxy_pass http://127.0.0.1:$((6080+i))/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"Upgrade\";
+        proxy_set_header Host \$host;
+        proxy_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+"
+    done
+    mkdir -p "${OR_DROPIN_DIR}"
+    [ -f "${OR_DROPIN}" ] && cp -a "${OR_DROPIN}" "${OR_DROPIN}.vps-setup.bak"
+    cat > "${OR_DROPIN}" <<EOF
+${VNC_CONFIG_MARK}
+# 本文件完全由脚本管理：升级/重跑只会覆盖本文件，不会动你的 nginx.conf，
+# 也不会动 conf.d 下其它 *.conf 文件。
+# 卸载 noVNC 站点：删掉本文件（+ 主配置里带同样标记的 include 行）后重载 openresty 即可。
+server {
+    listen ${port} ssl;
+    server_name _;
+    ssl_certificate ${SSL_CRT};
+    ssl_certificate_key ${SSL_KEY};
+
+    # /vnc1 /vnc2 /vnc3 → 三个 websockify 后端；/view 为只读入口
+    rewrite ^/vnc([0-9]+)/?\$ /vnc.html?path=websockify/\$1&autoconnect=true&reconnect=true redirect;
+    rewrite ^/view/?\$ /vnc.html?path=websockify/3&view_only=true&autoconnect=true redirect;
+
+    location / {
+        root ${NOVNC_WEB_ROOT};
+        index vnc.html;
+        try_files \$uri \$uri/ =404;
+        add_header Cache-Control "no-cache";
+    }
+
+${ws}}
+EOF
+}
+
+# 校验 + 加载；nginx -t 不通过就回滚本次写入，绝不让原有服务起不来
+reload_openresty_safe() {
+    local out
+    out=$("${OR_NGINX_BIN}" -t 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "❌ nginx 配置校验未通过，已回滚本次改动（你的原配置/原服务不受影响）："
+        printf '%s\n' "${out}" | sed 's/^/    /'
+        if [ -f "${OR_DROPIN}.vps-setup.bak" ]; then
+            mv -f "${OR_DROPIN}.vps-setup.bak" "${OR_DROPIN}"
+        else
+            rm -f "${OR_DROPIN}"
+        fi
+        if [ "${OR_MAIN_CHANGED:-0}" = "1" ] && [ -f "${OR_MAIN_BAK}" ]; then
+            mv -f "${OR_MAIN_BAK}" "${OR_MAIN_CONF}"
+            echo "    已恢复主配置：${OR_MAIN_CONF}"
+        fi
+        return 1
+    fi
+    rm -f "${OR_DROPIN}.vps-setup.bak"
+    if systemctl is-active --quiet openresty 2>/dev/null; then
+        "${OR_NGINX_BIN}" -s reload 2>/dev/null || systemctl restart openresty
+        echo "✅ openresty 已 reload（现有连接不中断）"
+    else
+        systemctl start openresty >/dev/null 2>&1 || true
+        echo "✅ openresty 已启动"
+    fi
+    return 0
+}
+
 install_novnc_and_openresty() {
-    echo "--- 配置 HTTPS 和 NoVNC ---"
+    echo "--- 配置 HTTPS 和 noVNC（增量式：只加 conf.d 文件，不覆盖你已有的 nginx.conf）---"
     # 这几个包 [1] 已装；单独跑本步时才补装（不会重复 apt update）
     ensure_pkgs haveged gnupg2 ca-certificates lsb-release
 
@@ -675,36 +909,65 @@ install_novnc_and_openresty() {
         chmod 644 ${SSL_CRT}; chmod 600 ${SSL_KEY}
     fi
 
-    mkdir -p /usr/local/openresty/nginx/logs/ /var/log/nginx/ /etc/openresty/conf.d
-    chown -R www-data:www-data /usr/local/openresty/nginx/logs/ /var/log/nginx/
-
-    NGINX_WS=""
-    for ((i=1; i<=3; i++)); do
-        NGINX_WS+="location /websockify/${i} { proxy_pass http://127.0.0.1:$((6080+i))/; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \"Upgrade\"; proxy_set_header Host \$host; proxy_buffering off; proxy_read_timeout 86400s; proxy_send_timeout 86400s; }"
-    done
+    detect_openresty_paths
+    mkdir -p "${OR_PREFIX}/logs" /var/log/nginx/ "${OR_DROPIN_DIR}"
+    chown -R www-data:www-data "${OR_PREFIX}/logs" /var/log/nginx/ 2>/dev/null || true
 
     patch_novnc_utf8_clipboard
 
-    cat > /etc/openresty/nginx.conf <<EOF
-user www-data; worker_processes auto;
-events { worker_connections 1024; }
-http {
-    include mime.types; default_type application/octet-stream;
-    server {
-        listen 443 ssl; server_name _;
-        ssl_certificate ${SSL_CRT}; ssl_certificate_key ${SSL_KEY};
-        rewrite ^/vnc([0-9]+)/?\$ /vnc.html?path=websockify/\$1&autoconnect=true&reconnect=true redirect;
-        rewrite ^/view/?\$ /vnc.html?path=websockify/3&view_only=true&autoconnect=true redirect;
-        location / { root $NOVNC_WEB_ROOT; index vnc.html; try_files \$uri \$uri/ =404; add_header Cache-Control "no-cache"; }
-        $NGINX_WS
-    }
+    OR_MAIN_CHANGED=0
+    rm -f "${OR_MAIN_BAK}"          # 每次运行都用当次状态做回滚备份
 
-    include conf.d/*.conf;
-}
-EOF
-    systemctl enable openresty
-    systemctl restart openresty
-    echo "✅ HTTPS 与 Nginx 配置完成。"
+    if [ ! -f "${OR_MAIN_CONF}" ]; then
+        write_minimal_openresty_conf
+        OR_MAIN_CHANGED=1
+        echo "ℹ️ 之前没有 nginx.conf，已生成最小基底：${OR_MAIN_CONF}"
+    else
+        # 1) 老版本内联的 noVNC server 块 → 摘到 conf.d 去（否则会和 drop-in 抢端口）
+        if grep -qF 'rewrite ^/vnc(' "${OR_MAIN_CONF}" 2>/dev/null; then
+            if strip_legacy_novnc_block; then
+                OR_MAIN_CHANGED=1
+                echo "ℹ️ 检测到旧版内联 noVNC server 块，已摘出为独立文件（备份：${OR_MAIN_BAK}）"
+            else
+                echo "⚠️ 尝试摘出旧版内联 noVNC 块失败，已放弃改动主配置。"
+            fi
+        fi
+        # 2) 确保主配置会加载 conf.d（已在则一个字都不改）
+        if novnc_include_present; then
+            echo "ℹ️ 你的 nginx.conf 已加载 conf.d —— 主配置不做任何改动"
+        elif add_novnc_include; then
+            OR_MAIN_CHANGED=1
+            echo "ℹ️ 你的 nginx.conf 没有 conf.d include，已增量补插 1 行（备份：${OR_MAIN_BAK}）"
+        else
+            echo "⚠️ 你的 nginx.conf 里没找到 http { 块，无法自动补 include，已放弃改动。"
+            echo "   请手工在 http {} 内加一行：include ${OR_DROPIN_DIR}/*.conf;"
+            return 1
+        fi
+    fi
+
+    # 3) noVNC 站点本体（我们自己的文件）
+    local port; port=$(pick_novnc_port)
+    write_novnc_dropin "${port}"
+
+    # 4) 校验通过才加载，失败自动回滚
+    reload_openresty_safe || return 1
+    systemctl enable openresty >/dev/null 2>&1 || true
+
+    local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}'); ip=${ip:-<服务器IP>}
+    local port_tag=""
+    [ "${port}" != "443" ] && port_tag=":${port}"
+    echo "✅ noVNC 站点已就绪：${OR_DROPIN}（listen ${port} ssl）"
+    echo "   访问地址：https://${ip}${port_tag}/vnc1   只读：https://${ip}${port_tag}/view"
+    [ "${port}" != "443" ] && echo "   ⚠️ 443 已被你其它 server 块占用，noVNC 改用 ${port}；记得在防火墙/端口转发里放行 ${port}"
+    echo "   自签证书首次访问需点一次「继续访问」。"
+    command -v curl >/dev/null 2>&1 && {
+        local code
+        code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${port}/vnc.html" 2>/dev/null)
+        case "${code}" in
+            200|30*) echo "   自检：本地 https://127.0.0.1:${port}/vnc.html → HTTP ${code} ✅" ;;
+            *)       echo "   自检：本地 https://127.0.0.1:${port}/vnc.html → HTTP ${code:-无响应} ⚠️（可看 journalctl -u openresty）" ;;
+        esac
+    }
 }
 
 patch_novnc_utf8_clipboard() {
@@ -1321,7 +1584,14 @@ print_credentials() {
     fi
     echo "   注意: VNC 协议密码上限 8 位，超出部分无效。"
     echo
-    echo " 访问地址             : https://<你的服务器公网IP>/vnc1"
+    local vurl="https://<你的服务器公网IP>/vnc1"
+    detect_openresty_paths
+    if [ -f "${OR_DROPIN}" ]; then
+        local vp_port
+        vp_port=$(grep -oE 'listen[[:space:]]+[0-9]+' "${OR_DROPIN}" 2>/dev/null | head -1 | grep -oE '[0-9]+')
+        [ -n "${vp_port}" ] && [ "${vp_port}" != "443" ] && vurl="https://<你的服务器公网IP>:${vp_port}/vnc1"
+    fi
+    echo " 访问地址             : ${vurl}"
     echo "   └ 本机 IP: ${ip}（容器/内网地址，仅供参考；自签证书需点「继续访问」）"
     if [ -f "${CRED_FILE}" ]; then
         echo " 凭据记录文件         : ${CRED_FILE} (权限 $(stat -c %a "${CRED_FILE}" 2>/dev/null))"

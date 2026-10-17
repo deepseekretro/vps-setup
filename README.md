@@ -127,6 +127,45 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
 也可用 `bash scripts/vnc_desktop_setup.sh --res-tool [用户名]` 单独刷新。
 注意：切换分辨率本质是重启 Xvfb，桌面会话会短暂重启，刷新 noVNC 网页即可。
 
+**HTTPS / noVNC 是增量配置，不会覆盖你已有的 nginx**（菜单 `[5]`）：
+旧实现是 `cat > /etc/openresty/nginx.conf` 整份覆盖，会把你自己配的 server / upstream /
+其它站点（例如 web terminal、反代、basic auth）一起抹掉。现在只做三件事：
+
+- **站点本体单独放**：`/usr/local/openresty/nginx/conf/conf.d/50-novnc.conf`
+  （脚本自有的 `server {}` 块，可反复覆盖）。想卸载 noVNC：删掉这个文件 + 重载即可。
+- **你的 `nginx.conf` 能不动就不动**：只有它内部没有任何会加载到该目录的 `include` 时，
+  才补插 2 行（一行带标记的注释 + 一行 `include <conf.d>/*.conf;`），插前自动备份到
+  `nginx.conf.vps-setup.bak`。
+- **端口自动避让**：优先 `443`；若该端口已被你别的 `server` 块占用（例如已有 443 站点），
+  noVNC 自动改用 `8443`，之后再跑会一直沿用（不会每次跳）。用了非 443 端口时，
+  记得在防火墙 / 端口转发里放行，例如 `https://IP:8443/vnc1`。
+- **老版本留下的「内联」配置会自动搬家**：早期版本把 noVNC 的 `server {}` 写在
+  `nginx.conf` 里，重跑时会按花括号把它整块摘出来放进 `conf.d`（只动含 noVNC 签名那一块，
+  你在同一个文件里另加的 `server` 块原样保留），因此访问地址不变。
+- **改完先校验再加载**：先 `nginx -t`，通过后用 `-s reload` 平滑加载（不中断现有连接）；
+  校验失败会自动把本次写入回滚（恢复主配置备份、删掉新写的 drop-in），**绝不会让你的站点起不来**。
+- 小知识：nginx 的**相对** `include` 是按「配置文件所在目录」解析的（不是 `--prefix`），
+  所以 `include conf.d/*.conf;` 指的就是 `nginx.conf` 旁边的 `conf.d/`。
+- 想让 noVNC 和现有站点共用 **443**（不额外开端口）：在你已有的 443 `server {}` 里加一行
+  `include <conf.d>/novnc-proxy.inc;`，文件内容见下文附录。
+
+**把 noVNC 挂到已有站点的 443 下（可选，附录）**：先让 `[5]` 把 noVNC 装到 `8443`
+（它会自动这么做），再新建 `/usr/local/openresty/nginx/conf/conf.d/novnc-proxy.inc`：
+
+```nginx
+# 由 vps-setup 生成：把 noVNC（本机 8443）挂到现有 443 站点的 /novnc/ 下
+location = /vnc1 { return 302 /novnc/vnc.html?path=websockify/1&autoconnect=true&reconnect=true; }
+location = /view { return 302 /novnc/vnc.html?path=websockify/3&view_only=true&autoconnect=true; }
+location ^~ /novnc/websockify/1 { proxy_pass http://127.0.0.1:6081/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
+location ^~ /novnc/websockify/2 { proxy_pass http://127.0.0.1:6082/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
+location ^~ /novnc/websockify/3 { proxy_pass http://127.0.0.1:6083/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
+location ^~ /novnc/ { proxy_pass https://127.0.0.1:8443/; proxy_ssl_verify off; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; auth_basic off; }
+```
+
+之后访问 `https://IP/vnc1` 即可（`auth_basic off;` 表示只由 VNC 自己的密码把关；
+想去掉这行就变成「站点密码 + VNC 密码」双重保护）。文件名故意用 `.inc` 而不是 `.conf`，
+避免被 `include conf.d/*.conf;` 在 `http` 层重复加载。
+
 **精简安装**：所有 apt 安装均带 `--no-install-recommends`（避免推荐包带进
 zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等数百 MiB），
 中文字体只装体积更小的 `fonts-wqy-microhei`；Wine / Edge / Gost 保持独立菜单可选项，按需安装。
