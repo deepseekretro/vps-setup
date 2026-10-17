@@ -576,6 +576,7 @@
 
     var tabEl = document.createElement('div');
     tabEl.className = 'tab';
+    tabEl.dataset.tid = id;                        // tab drag maps a strip element back to its tab
     var dot = document.createElement('span'); dot.className = 'dot';
     var label = document.createElement('span'); label.className = 'label';
     label.textContent = (opts.title && !opts.userTitled) ? opts.title : ('Tab ' + n);
@@ -1162,12 +1163,36 @@
 
   function clearDropZone() {
     if (!dropState) return;
-    dropState.paneEl.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom', 'dz-center');
+    if (dropState.paneEl) dropState.paneEl.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom', 'dz-center');
+    if (dropState.tabEl) dropState.tabEl.classList.remove('droptab', 'drop-before', 'drop-after');
     dropState = null;
+  }
+
+  // What the floating label says about the place you are hovering.
+  function dropHint(drop) {
+    if (!drop) return '';
+    if (drop.kind === 'strip') return '放到这里';
+    if (layoutMode === 'grid') {
+      return (drop.zone === 'center') ? '换到这一格' : ('上墙：' + (SIDE_LABEL[drop.zone] || '这里'));
+    }
+    return '分屏：' + (SIDE_LABEL[drop.zone] || '这里');
   }
 
   function updateDropZone(x, y) {
     var hit = document.elementFromPoint(x, y);
+    // 1) over the tab strip -> re-order the tabs themselves
+    var overTab = (hit && hit.closest) ? hit.closest('.tab') : null;
+    if (overTab && tabbar.contains(overTab) && overTab.dataset.tid) {
+      var r0 = overTab.getBoundingClientRect();
+      var after = x > r0.left + r0.width / 2;
+      if (!dropState || dropState.kind !== 'strip' || dropState.tabEl !== overTab || dropState.after !== after) {
+        clearDropZone();
+        overTab.classList.add('droptab', after ? 'drop-after' : 'drop-before');
+        dropState = { kind: 'strip', tabEl: overTab, tabId: overTab.dataset.tid, after: after };
+      }
+      return dropState;
+    }
+    // 2) over a pane -> 横排: split there / 宫格: put it on the wall there
     if (!hit || !paneIdOf(hit)) { clearDropZone(); return null; }
     var paneEl = hit.closest('.pane');
     var r = paneEl.getBoundingClientRect();
@@ -1179,12 +1204,89 @@
     else if ((r.bottom - y) / r.height < edge) zone = 'bottom';
     else if (layoutMode === 'grid') zone = 'center';   // 宫格: the whole cell = 换掉这格
     if (!zone) { clearDropZone(); return null; }
-    if (!dropState || dropState.paneEl !== paneEl || dropState.zone !== zone) {
+    if (!dropState || dropState.kind !== 'pane' || dropState.paneEl !== paneEl || dropState.zone !== zone) {
       clearDropZone();
       paneEl.classList.add('droptgt', 'dz-' + zone);
-      dropState = { paneEl: paneEl, zone: zone };
+      dropState = { kind: 'pane', paneEl: paneEl, zone: zone };
     }
-    return { paneEl: paneEl, zone: zone };
+    return dropState;
+  }
+
+  /* ---- the tab you are dragging follows the pointer (a small floating label) ---- */
+
+  var dragGhost = null;
+
+  function showGhost(t, ev) {
+    if (dragGhost) return;
+    var g = document.createElement('div');
+    g.className = 'tabghost';
+    var dot = document.createElement('span'); dot.className = 'ghostdot';
+    var label = document.createElement('span');
+    label.textContent = t.labelEl.textContent || '终端';
+    var act = document.createElement('span'); act.className = 'ghostact';
+    g.append(dot, label, act);
+    document.body.appendChild(g);
+    dragGhost = { el: g, act: act, x: ev.clientX, y: ev.clientY, raf: 0 };
+    document.body.classList.add('wt-dragging');
+    moveGhost(ev);
+  }
+
+  function moveGhost(ev) {
+    if (!dragGhost) return;
+    dragGhost.x = ev.clientX;
+    dragGhost.y = ev.clientY;
+    if (dragGhost.raf) return;
+    dragGhost.raf = requestAnimationFrame(function () {
+      if (!dragGhost) return;
+      dragGhost.raf = 0;
+      // keep the label under the cursor, nudged so it never covers the drop target
+      dragGhost.el.style.transform = 'translate(' + (dragGhost.x + 14) + 'px,' +
+                                     (dragGhost.y + 10) + 'px)';
+    });
+  }
+
+  function hideGhost() {
+    if (!dragGhost) return;
+    if (dragGhost.raf) cancelAnimationFrame(dragGhost.raf);
+    dragGhost.el.remove();
+    dragGhost = null;
+    document.body.classList.remove('wt-dragging');
+  }
+
+  /* ---- re-ordering the tabs by dragging inside the strip ---- */
+
+  function stripIndex(id) {
+    var all = Array.prototype.slice.call(tabbar.querySelectorAll('.tab'));
+    for (var i = 0; i < all.length; i++) if (all[i].dataset.tid === id) return i + 1;
+    return 0;
+  }
+
+  // Keep the Map order (persisted, and used by Alt+1..9 / 全部上墙 / pane order)
+  // in sync with the visible strip order.
+  function rebuildTabOrder() {
+    var order = [];
+    Array.prototype.forEach.call(tabbar.querySelectorAll('.tab'), function (el) {
+      if (el.dataset.tid && tabs.has(el.dataset.tid)) order.push(el.dataset.tid);
+    });
+    if (order.length !== tabs.size) return;               // never lose a tab
+    var pairs = order.map(function (tid) { return [tid, tabs.get(tid)]; });
+    tabs.clear();
+    pairs.forEach(function (p) { tabs.set(p[0], p[1]); });
+  }
+
+  function moveTabInStrip(id, targetId, after) {
+    var src = tabs.get(id), tgt = tabs.get(targetId);
+    if (!src || !tgt || id === targetId) return;
+    var ref = after ? tgt.tabEl.nextSibling : tgt.tabEl;
+    if (ref === src.tabEl) return;                        // already in that place
+    tabbar.insertBefore(src.tabEl, ref || tabMoreBtn);
+    rebuildTabOrder();
+    saveTabs();                                           // remember the new order
+    renderLayout();                                       // panes follow the strip order
+    scheduleTabbar();
+    // NOTE: no activate() here on purpose — re-ordering must not change which
+    // terminal is focused (in 宫格 that would also drag it onto the wall).
+    toast('已把「' + (src.labelEl.textContent || '终端') + '」移到第 ' + stripIndex(id) + ' 位');
   }
 
   function wireTabDrag(t, id, closeEl) {
@@ -1198,8 +1300,11 @@
           if (Math.abs(ev.clientX - st.x) < 6 && Math.abs(ev.clientY - st.y) < 6) return;
           st.active = true;
           t.tabEl.classList.add('dragging');
+          showGhost(t, ev);
         }
+        moveGhost(ev);
         st.drop = updateDropZone(ev.clientX, ev.clientY);
+        if (dragGhost) dragGhost.act.textContent = dropHint(st.drop);
       }
       function cleanup() {
         t.tabEl.removeEventListener('pointermove', move);
@@ -1207,16 +1312,20 @@
         t.tabEl.removeEventListener('pointercancel', cancel);
         t.tabEl.classList.remove('dragging');
         clearDropZone();
+        hideGhost();
       }
       function up() {
         var drop = st.active ? st.drop : null;
         cleanup();
-        if (drop && tabs.has(id)) {
-          var pid = paneIdOf(drop.paneEl);
-          if (pid && pid !== id && tabs.has(pid)) {
-            if (layoutMode === 'grid') gridDrop(id, pid, drop.zone);  // 宫格: 上墙/换位
-            else movePane(id, pid, drop.zone);                        // 横排: 分屏
-          }
+        if (!drop || !tabs.has(id)) return;
+        if (drop.kind === 'strip') {                       // dropped back on the strip
+          if (drop.tabId && drop.tabId !== id) moveTabInStrip(id, drop.tabId, drop.after);
+          return;
+        }
+        var pid = paneIdOf(drop.paneEl);
+        if (pid && pid !== id && tabs.has(pid)) {
+          if (layoutMode === 'grid') gridDrop(id, pid, drop.zone);  // 宫格: 上墙/换位
+          else movePane(id, pid, drop.zone);                        // 横排: 分屏
         }
       }
       function cancel() { cleanup(); }
@@ -1227,7 +1336,7 @@
     });
   }
 
-  window.addEventListener('blur', clearDropZone);
+  window.addEventListener('blur', function () { clearDropZone(); hideGhost(); });
 
   /* ---------------- layout modes: 横排 / 宫格 / 分组 ----------------
    *

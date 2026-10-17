@@ -257,6 +257,23 @@
   /* 宫格: the terminal has a cell on the wall (drag it onto the stage to rearrange) */
   .tab.on-wall { border-color: rgba(25, 169, 123, .55); background: rgba(25, 169, 123, .10); }
   .tab.on-wall .label::before { content: "▦"; color: var(--accent); margin-right: 4px; font-size: 11px; }
+  /* dragging a tab: the label follows the pointer, and the strip shows where it lands */
+  body.wt-dragging, body.wt-dragging * { cursor: grabbing !important; }
+  .tabghost {
+    position: fixed; left: 0; top: 0; z-index: 70; pointer-events: none;
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 8px; font-size: 13px; white-space: nowrap;
+    background: var(--tab-bg); color: var(--text);
+    border: 1px solid var(--accent); box-shadow: 0 8px 22px rgba(0, 0, 0, .5);
+    opacity: .95;
+  }
+  .tabghost .ghostdot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: 0 0 auto;
+  }
+  .tabghost .ghostact { color: var(--accent); font-size: 12px; }
+  .tabghost .ghostact:empty { display: none; }
+  .tab.droptab.drop-before { box-shadow: inset 3px 0 0 0 var(--accent); }
+  .tab.droptab.drop-after  { box-shadow: inset -3px 0 0 0 var(--accent); }
   .pane.droptgt::after {
     content: ""; position: absolute; z-index: 6; pointer-events: none;
     background: rgba(25, 169, 123, .22); border: 2px dashed var(--accent); border-radius: 8px;
