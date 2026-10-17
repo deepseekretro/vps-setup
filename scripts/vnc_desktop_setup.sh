@@ -140,6 +140,10 @@ setup_swap() {
 }
 
 setup_system_and_user_and_locale() {
+    # 桌面运行用户在此确定（模块入口不再统一询问）
+    echo "--- 0. 设置桌面运行用户 ---"
+    configure_username
+
     echo "--- 1. 更新系统与基础依赖 ---"
     setup_swap
     apt update
@@ -196,8 +200,8 @@ setup_system_and_user_and_locale() {
 
 install_lxde_desktop() {
     # 安装桌面核心前，先设置「桌面运行用户」：
-    # LXDE / Xvfb / x11vnc / MT5 全部以该用户身份运行，这里再确认一次，
-    # 并同步刷新 USER_HOME 等派生变量；用户不存在则一并创建（幂等）。
+    # LXDE / Xvfb / x11vnc / MT5 全部以该用户身份运行。模块入口不再统一询问，
+    # 用户在此确定；并同步刷新 USER_HOME 等派生变量，用户不存在则一并创建（幂等）。
     echo "--- 0. 设置桌面运行用户 ---"
     configure_username
     create_desktop_user
@@ -868,6 +872,11 @@ main_menu() {
 }
 
 check_root
-configure_username
+
+# 模块入口不再询问桌面运行用户，只按默认/当前 VNC_USER 初始化派生路径
+# （USER_HOME、.vnc、Desktop 等，供 [3]-[8] 使用）。
+# 桌面运行用户改由 [1] 初始化系统环境 / [2] 安装 LXDE 桌面核心 各自设置。
+update_variables
+
 main_menu
 
