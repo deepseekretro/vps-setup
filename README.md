@@ -77,3 +77,18 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
 （`systemd-detect-virt` / `/run/systemd/container` / `/proc/1/environ` 的 `container=` 等），
 命中即**跳过 swapfile 的创建与启用**，交由宿主机统一管理；非容器环境才会创建 swap。
 另外脚本会检查 `/proc/swaps`，绝不覆盖正在使用的 swap 文件。
+
+**桌面加固（屏蔽注销/关机/屏幕锁）**：装完 LXDE 会自动执行（也可随时用菜单
+`[10] 屏蔽桌面「注销/关机/屏幕锁」`，或 `bash scripts/vnc_desktop_setup.sh --harden` 补做），幂等：
+
+- lxpanel 面板：移除右下角「屏幕锁 / 注销」按钮与主菜单里的注销项（写入**用户级**
+  `~/.config/lxpanel/LXDE/panels/panel`，不改包自带文件，升级不会被覆盖）
+- `lxde-logout` / `lxsession-logout` / `lxlock` / `light-locker` / `xscreensaver`
+  经 `dpkg-divert` 备份为同名 `.real` 后替换为空操作 → **点击毫无反应**
+- 用户级隐藏 `lxde-logout` / `lxde-screenlock` 桌面条目；`@xset s off -dpms s noblank` 防息屏
+- 恢复注销功能：`dpkg-divert --remove /usr/bin/lxde-logout`（`.real` 是原程序），
+  并删除用户级 panel 配置后重启 `vnc-desktop@1`
+
+**精简安装**：所有 apt 安装均带 `--no-install-recommends`（避免推荐包带进
+zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等数百 MiB），
+中文字体只装体积更小的 `fonts-wqy-microhei`；Wine / Edge / Gost 保持独立菜单可选项，按需安装。

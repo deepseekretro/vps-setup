@@ -82,6 +82,130 @@ create_desktop_user() {
     loginctl enable-linger ${VNC_USER} 2>/dev/null || true
 }
 
+# =======================================================
+# 桌面加固：屏蔽「注销/关机」入口与「屏幕锁」，让点击无反应
+#   - lxpanel：移除右下角「屏幕锁 / 注销」按钮 + 主菜单里的注销项
+#   - 注销/锁屏程序：dpkg-divert 备份后替换为空操作（点击无任何反应）
+#   - 隐藏 lxde-logout / lxde-screenlock 桌面条目（用户级 Hidden=true，升级不复活）
+#   - 屏保/息屏：light-locker / xscreensaver / DPMS 全部关闭
+# 幂等：重复执行只做校验与补齐。
+# =======================================================
+silence_desktop_bins() {
+    local p bin
+
+    # 用户级隐藏「注销 / 锁屏」桌面条目（覆盖系统 .desktop，避免菜单里复活）
+    local apps_dir="${USER_HOME}/.local/share/applications"
+    mkdir -p "${apps_dir}"
+    for p in lxde-logout lxde-screenlock xscreensaver; do
+        cat > "${apps_dir}/${p}.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${p} (disabled)
+Hidden=true
+NoDisplay=true
+EOF
+    done
+    chown -R ${VNC_USER}:${VNC_USER} "${USER_HOME}/.local" 2>/dev/null || true
+
+    # 隐藏 light-locker 自启动（防止长时间无人后黑屏上锁）
+    if [ -f /etc/xdg/autostart/light-locker.desktop ]; then
+        sed -i '/^Hidden=/d' /etc/xdg/autostart/light-locker.desktop
+        echo "Hidden=true" >> /etc/xdg/autostart/light-locker.desktop
+    fi
+
+    # 注销/锁屏程序 → 空操作（原程序备份为同名 .real，恢复见函数末尾提示）
+    for p in lxde-logout lxsession-logout lxlock light-locker xscreensaver; do
+        bin=$(command -v "${p}" 2>/dev/null || true)
+        [ -z "${bin}" ] && continue
+        [ -f "${bin}.real" ] && continue      # 已处理过（幂等）
+        dpkg-divert --add --rename --divert "${bin}.real" "${bin}" >/dev/null 2>&1 || true
+        cat > "${bin}" << 'EOF_SILENT'
+#!/bin/sh
+# 已被 vps-setup 桌面加固禁用（原程序见同目录同名 .real）
+exit 0
+EOF_SILENT
+        chmod +x "${bin}"
+    done
+}
+
+harden_desktop_session() {
+    echo "--- 桌面加固：屏蔽「注销 / 关机 / 屏幕锁」---"
+    silence_desktop_bins
+
+    # ---- 1) 处理 lxpanel 面板配置：去掉「注销」「屏幕锁」按钮与菜单注销项 ----
+    local panel_src="/etc/xdg/lxpanel/LXDE/panels/panel"
+    local panel_dir="${USER_HOME}/.config/lxpanel/LXDE/panels"
+    local panel_dst="${panel_dir}/panel"
+    local panel_in=""
+    [ -f "${panel_dst}" ] && panel_in="${panel_dst}"          # 已有用户配置以它为准
+    [ -z "${panel_in}" ] && [ -f "${panel_src}" ] && panel_in="${panel_src}"
+
+    if [ -n "${panel_in}" ]; then
+        mkdir -p "${panel_dir}"
+        local awkf; awkf=$(mktemp)
+        cat > "${awkf}" << 'EOF_AWK'
+# 1) 含 lxde-logout / lxde-screenlock 按钮的整块 Plugin {...} 直接丢弃
+# 2) 保留的 Plugin 内，删除 config 为 command=logout 的 item {...}
+function strip_item(text,    n, a, i, out, in_item, buf, drop) {
+    n = split(text, a, "\n")
+    out = ""; in_item = 0; drop = 0; buf = ""
+    for (i = 1; i <= n; i++) {
+        if (a[i] == "" && i == n) continue
+        if (!in_item && a[i] ~ /^[[:space:]]*item[[:space:]]*\{[[:space:]]*$/) {
+            in_item = 1; drop = 0; buf = a[i] "\n"; continue
+        }
+        if (in_item) {
+            buf = buf a[i] "\n"
+            if (a[i] ~ /command[[:space:]]*=[[:space:]]*logout/) drop = 1
+            if (a[i] ~ /^[[:space:]]*\}[[:space:]]*$/) {
+                in_item = 0
+                if (!drop) out = out buf
+            }
+            continue
+        }
+        out = out a[i] "\n"
+    }
+    return out
+}
+BEGIN { inplug = 0; plug = "" }
+/^Plugin[[:space:]]*\{/ { inplug = 1; plug = $0 "\n"; next }
+inplug {
+    plug = plug $0 "\n"
+    if ($0 ~ /^\}[[:space:]]*$/) {
+        inplug = 0
+        if (plug !~ /lxde-logout\.desktop|lxde-screenlock\.desktop/) printf "%s", strip_item(plug)
+    }
+    next
+}
+{ print }
+EOF_AWK
+        if awk -f "${awkf}" "${panel_in}" > "${panel_dst}.new" 2>/dev/null \
+           && [ "$(wc -c < "${panel_dst}.new" 2>/dev/null || echo 0)" -gt 200 ] \
+           && ! grep -q "lxde-logout\.desktop\|lxde-screenlock\.desktop" "${panel_dst}.new"; then
+            mv "${panel_dst}.new" "${panel_dst}"
+            echo "✅ lxpanel 面板：已移除右下角「注销 / 屏幕锁」按钮与菜单里的注销项"
+        else
+            rm -f "${panel_dst}.new"
+            echo "⚠️ lxpanel 面板配置处理失败，保持原样"
+        fi
+        rm -f "${awkf}"
+    else
+        echo "ℹ️ 未找到 lxpanel 面板配置（可能尚未安装 LXDE 桌面核心），跳过"
+    fi
+    chown -R ${VNC_USER}:${VNC_USER} "${USER_HOME}/.config/lxpanel" 2>/dev/null || true
+
+    # ---- 2) 屏保/息屏长效关闭（写入会话自启动，重启桌面仍生效）----
+    local lx_dir="${USER_HOME}/.config/lxsession/LXDE"
+    mkdir -p "${lx_dir}"
+    touch "${lx_dir}/autostart"
+    grep -q "xset s off" "${lx_dir}/autostart" || echo "@xset s off -dpms s noblank" >> "${lx_dir}/autostart"
+    chown -R ${VNC_USER}:${VNC_USER} "${lx_dir}" 2>/dev/null || true
+
+    echo "✅ 桌面加固完成（注销/关机/屏幕锁入口均已失效）"
+    echo "   如需恢复注销功能: dpkg-divert --remove /usr/bin/lxde-logout"
+    echo "   并删除 ${USER_HOME}/.config/lxpanel/LXDE/panels/panel 后重启桌面服务。"
+}
+
 # 检测是否运行在容器内（LXC/Docker/Podman/OpenVZ...），返回类型字符串
 #
 # 为什么容器内绝不能碰 swap：
@@ -147,14 +271,19 @@ setup_system_and_user_and_locale() {
     echo "--- 1. 更新系统与基础依赖 ---"
     setup_swap
     apt update
-    apt install -y curl wget sudo gnupg2 sed locales xdg-user-dirs openssl haveged xvfb x11vnc unzip zip lsof apt-transport-https ca-certificates procps net-tools psmisc wmctrl xdotool autocutsel lsb-release x11-xserver-utils rtkit
+    # 全部 --no-install-recommends：避免拉进 zenity/libwebkit2gtk/ghostscript/
+    # imagemagick/gstreamer/mesa-vulkan 等数百 MiB 的推荐包（实测可省 300~500 MiB）
+    apt install -y --no-install-recommends curl wget sudo gnupg2 sed locales xdg-user-dirs openssl haveged \
+        xvfb x11vnc apt-transport-https ca-certificates procps \
+        wmctrl xdotool autocutsel lsb-release x11-xserver-utils
     mkdir -p /etc/pipewire && touch /etc/pipewire/client.conf
 
     echo "--- 2. 安装中文字体 ---"
-    apt install -y fonts-wqy-microhei fonts-wqy-zenhei
+    # 只装微米黑（体积小、覆盖常用简繁中文）；如需更多字形可自行追加 fonts-wqy-zenhei
+    apt install -y --no-install-recommends fonts-wqy-microhei
 
     echo "--- 3. 安装 Fcitx4 + Google 拼音 ---"
-    apt install -y fcitx fcitx-googlepinyin fcitx-ui-classic fcitx-config-gtk \
+    apt install -y --no-install-recommends fcitx fcitx-googlepinyin fcitx-ui-classic fcitx-config-gtk \
                     fcitx-frontend-gtk2 fcitx-frontend-gtk3 fcitx-frontend-qt5 \
                     dbus-x11 im-config libgtk2.0-bin libgtk-3-bin at-spi2-core
 
@@ -209,6 +338,9 @@ install_lxde_desktop() {
     echo "--- 安装 LXDE 桌面核心 ---"
     apt install -y --no-install-recommends ${PKG_LXDE} ${DBUS_PACKAGE}
     echo "✅ LXDE 桌面核心安装完成（桌面运行用户: ${VNC_USER}）"
+
+    # 装完立即加固：屏蔽右下角「注销/屏幕锁」按钮与菜单注销项
+    harden_desktop_session
 }
 
 install_wine_env() {
@@ -242,17 +374,17 @@ EOF
 install_edge_browser() {
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" > /etc/apt/sources.list.d/microsoft-edge.list
-    apt update; apt install -y microsoft-edge-stable
+    apt update; apt install -y --no-install-recommends microsoft-edge-stable
 }
 
 install_novnc_and_openresty() {
     echo "--- 配置 HTTPS 和 NoVNC ---"
-    apt install -y haveged gnupg2 ca-certificates lsb-release
+    apt install -y --no-install-recommends haveged gnupg2 ca-certificates lsb-release
 
     mkdir -p /usr/share/keyrings
     wget -qO - https://openresty.org/package/pubkey.gpg | gpg --dearmor --yes -o /usr/share/keyrings/openresty.gpg
     echo "deb [signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/debian $(lsb_release -sc) openresty" | tee /etc/apt/sources.list.d/openresty.list
-    apt update; apt install -y openresty novnc websockify
+    apt update; apt install -y --no-install-recommends openresty novnc websockify
 
     mkdir -p ${SSL_CERT_DIR}
     if [ ! -f "${SSL_CRT}" ]; then
@@ -370,18 +502,8 @@ if target in content:
     fi
 
     # 彻底禁用 light-locker 屏幕锁与息屏，防止长时间放置后黑屏
-    if [ -f /etc/xdg/autostart/light-locker.desktop ]; then
-        sed -i '/^Hidden=/d' /etc/xdg/autostart/light-locker.desktop
-        echo "Hidden=true" >> /etc/xdg/autostart/light-locker.desktop
-    fi
-    if command -v light-locker >/dev/null 2>&1 && [ ! -f /usr/bin/light-locker.real ]; then
-        dpkg-divert --add --rename --divert /usr/bin/light-locker.real /usr/bin/light-locker 2>/dev/null || true
-        cat << 'EOF_LOCK' > /usr/bin/light-locker
-#!/bin/sh
-exit 0
-EOF_LOCK
-        chmod +x /usr/bin/light-locker
-    fi
+    # （统一由 silence_desktop_bins 处理，幂等，可重复调用）
+    silence_desktop_bins
 
     echo "✅ noVNC 中文剪贴板双向补丁与防黑屏长效保持已就绪。"
 }
@@ -702,7 +824,7 @@ EOF_TOOL
 
 create_edge_tool() {
     echo "--- 生成 Edge 控制工具 ---"
-    apt update && apt install -y wmctrl xdotool
+    apt update && apt install -y --no-install-recommends wmctrl xdotool
     local tool_path="${DESKTOP_DIR}/重置Edge窗口.sh"
 
     cat > "${tool_path}" << 'EOF'
@@ -806,6 +928,9 @@ activate_pipeline_services() {
     setup_mt5_watchdog_script
     create_pipeline_res_tool
 
+    # 启动前再加固一次（面板/菜单/锁屏入口），保证新会话起来即是加固后的样子
+    harden_desktop_session
+
     # 平稳过渡：停止并禁用旧版单体服务 (防止显示号 :1 与 5901 冲突)
     if systemctl is-active vnc-server >/dev/null 2>&1 || systemctl is-enabled vnc-server >/dev/null 2>&1; then
         echo "🛑 正在平稳过渡：停止并注销旧版 vnc-server 服务..."
@@ -843,6 +968,7 @@ main_menu() {
         echo " [7] 生成 Edge 控制工具 (桌面快捷)"
         echo " [8] 安装 Gost 隧道代理 (Systemd 微服务版)"
         echo " [9] 查看各微服务运行状态 (systemctl)"
+        echo " [10] 屏蔽桌面「注销/关机/屏幕锁」(桌面加固)"
         echo " [99] 停止所有服务 (VNC级联与Gost)"
         echo " [0] 退出"
         read -p "选项: " c
@@ -865,6 +991,11 @@ main_menu() {
                 systemctl stop vnc-stack@1.target xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 gost 2>/dev/null || true
                 echo "已停止所有服务。"
                 ;;
+            10)
+                harden_desktop_session
+                echo "🔄 正在重启桌面会话以让面板配置生效..."
+                systemctl restart vnc-desktop@1 2>/dev/null || true
+                ;;
             0) exit 0 ;;
         esac
         read -p "按回车继续..."
@@ -877,6 +1008,18 @@ check_root
 # （USER_HOME、.vnc、Desktop 等，供 [3]-[8] 使用）。
 # 桌面运行用户改由 [1] 初始化系统环境 / [2] 安装 LXDE 桌面核心 各自设置。
 update_variables
+
+# 非交互入口：--harden [用户名]
+#   仅执行桌面加固（屏蔽注销/关机/屏幕锁），供脚本化调用或事后补做
+if [ "${1:-}" = "--harden" ]; then
+    check_root
+    if [ -n "${2:-}" ]; then
+        VNC_USER="$2"
+        update_variables
+    fi
+    harden_desktop_session
+    exit 0
+fi
 
 main_menu
 
