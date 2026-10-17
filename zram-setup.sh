@@ -207,7 +207,9 @@ show_status() {
     printf '  disksize   %s MiB\n' "$(($(cat /sys/block/zram0/disksize)/1048576))"
     printf '  algorithm  %s\n' "$(cat /sys/block/zram0/comp_algorithm 2>/dev/null)"
     if [[ -e /sys/block/zram0/mem_limit ]]; then
-      printf '  mem_limit  %s MiB\n' "$(($(cat /sys/block/zram0/mem_limit 2>/dev/null || echo 0)/1048576))"
+      # mem_limit 属性是「只写」的（--w-------），只能从 mm_stat 第 4 字段读回
+      ML_BYTES=$(awk '{print $4}' /sys/block/zram0/mm_stat 2>/dev/null || echo 0)
+      printf '  mem_limit  %s MiB\n' "$(( ${ML_BYTES:-0} / 1048576 ))"
     fi
     if [[ -r /sys/block/zram0/mm_stat ]]; then
       awk '{printf "  mm_stat    原始=%dMiB 压缩后=%dMiB 真实占用=%dMiB 压缩比≈%.2f\n",$1/1048576,$2/1048576,$3/1048576,($2>0?$1/$2:0)}' /sys/block/zram0/mm_stat
@@ -297,6 +299,14 @@ if [[ -n "$NONZRAM_SWAP" ]]; then
   if [[ "$SWAPFILE" == "auto" ]]; then
     echo "   策略=auto：保持现状，不新建、不改大小"
   fi
+  # 如实报告实际优先级（上面的打印值只在新建/追加 fstab 时才会生效）
+  for dev in $NONZRAM_SWAP; do
+    prio=$(swapon --show=NAME,PRIO --noheadings 2>/dev/null | awk -v d="$dev" '$1==d{print $2; exit}')
+    fstab_line=$(grep "^${dev} " /etc/fstab 2>/dev/null || true)
+    if [[ -n "$fstab_line" && "$fstab_line" != *"pri="* ]]; then
+      warn "fstab 中 ${dev} 未指定 pri=（当前实际优先级 ${prio:-?}），保持不变（仍低于 zram 的 ${ZRAM_PRIO}）"
+    fi
+  done
   if (( RESIZE_SWAPFILE )) && (( FINAL_SF > 0 )) && [[ "$NONZRAM_SWAP" == "$SWAPFILE_PATH" ]]; then
     CUR_MB=$(( $(stat -c %s "$SWAPFILE_PATH" 2>/dev/null || echo 0) / 1048576 ))
     if (( CUR_MB == FINAL_SF )); then
@@ -403,7 +413,9 @@ WantedBy=multi-user.target
 EOF
   run systemctl daemon-reload
   run systemctl restart systemd-zram-setup@zram0.service
-  run systemctl enable --now zram-mem-limit.service
+  # oneshot + RemainAfterExit 的单元若已 active(exited)，enable --now 不会重跑 ExecStart
+  run systemctl enable zram-mem-limit.service
+  run systemctl restart zram-mem-limit.service
 else
   if (( DRY )); then ok "（dry-run 探测不到 generator，按回退方案演示）"; fi
   warn "未检测到 zram-generator → 回退自带 unit（可 apt install systemd-zram-generator 后用官方方案）"
@@ -445,7 +457,11 @@ ExecStop=/usr/local/sbin/zram-swap-down
 WantedBy=swap.target
 EOF
   run systemctl daemon-reload
-  run systemctl enable --now zram-swap.service
+  # 关键：oneshot + RemainAfterExit 的单元若已处于 active(exited)（例如重复部署），
+  # `enable --now` 是空操作，不会重新执行 ExecStart，必须显式 restart。
+  # 否则脚本前面刚 swapoff+reset 掉 zram0，却没有人把它重新拉起来。
+  run systemctl enable zram-swap.service
+  run systemctl restart zram-swap.service
 fi
 
 # 5) sysctl
