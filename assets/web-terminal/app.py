@@ -13,6 +13,7 @@ Protocol (JSON frames):
     {"type": "resize", "id": "...", "cols": 80, "rows": 24}
     {"type": "close",  "id": "..."}                                 kill a session
     {"type": "list"}                                                list live sessions
+    {"type": "cwds"}                                                per-session cwd (grouping)
     {"type": "upload", "id": "...", "upid": "...", "name": "...", "mime": "image/png",
      "seq": 0, "data": "<base64 chunk>", "last": false}             image upload
     {"type": "ping"}
@@ -22,6 +23,7 @@ Protocol (JSON frames):
     {"type": "attached", "id": "..."}                 session is live and attached
     {"type": "exit",     "id": "...", "code": 0}
     {"type": "sessions", "ids": ["...", ...]}
+    {"type": "cwds", "home": "/root", "items": {"<id>": "<cwd>", ...}}
     {"type": "upload_done",  "id", "upid", "path", "rel", "name", "bytes", "mime"}
     {"type": "upload_error", "id", "upid", "error"}
     {"type": "pong"}
@@ -351,6 +353,18 @@ def buffer_out(ses, data):
         del buf[:cut]
 
 
+def session_cwd(ses):
+    """Best-effort current directory of a session's shell.
+
+    Read straight out of /proc instead of parsing OSC 7: it works for every
+    shell (no prompt hooks needed) and costs one readlink per request.
+    """
+    try:
+        return os.readlink("/proc/%d/cwd" % ses["proc"].pid)
+    except OSError:
+        return ""
+
+
 def create_session(sid, cols=80, rows=24):
     """Spawn a shell in a fresh PTY. Returns True on success."""
     if sid in SESSIONS:
@@ -610,6 +624,11 @@ async def handler(ws):
                 remove_session(sid)
             elif mtype == "list":
                 await ws.send(json.dumps({"type": "sessions", "ids": list(SESSIONS)}))
+            elif mtype == "cwds":
+                # "分组" layout: group terminal tabs by their shell's directory
+                await ws.send(json.dumps({
+                    "type": "cwds", "home": DEFAULT_CWD,
+                    "items": {s: session_cwd(x) for s, x in list(SESSIONS.items())}}))
             elif mtype == "opencode_sessions":
                 items, err = await opencode_sessions(bool(msg.get("force")))
                 await ws.send(json.dumps({"type": "opencode_sessions",

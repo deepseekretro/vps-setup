@@ -30,15 +30,40 @@
   }
   header .logo { font-weight: 700; letter-spacing: .5px; color: var(--accent); }
   header .logo small { color: var(--muted); font-weight: 400; margin-left: 6px; }
-  #status { font-size: 12px; padding: 2px 10px; border-radius: 10px; background: #3a3320; color: #ffb54d; }
+  #status {
+    font-size: 12px; padding: 2px 10px; border-radius: 10px; background: #3a3320;
+    color: #ffb54d; flex: 0 0 auto; white-space: nowrap;
+  }
   #status.ok { background: #1d3b31; color: var(--accent); }
   header .spacer { flex: 1; }
-  header .hint { font-size: 12px; color: var(--muted); }
+  header .hint {
+    font-size: 12px; color: var(--muted); min-width: 0;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
   #navtoggle {
     background: transparent; border: 1px solid var(--border); color: var(--muted);
     border-radius: 7px; padding: 4px 10px; font-size: 12px; cursor: pointer; flex: 0 0 auto;
   }
   #navtoggle:hover, #navtoggle.on { color: var(--accent); border-color: var(--accent); }
+
+  /* ---- layout switcher: 横排 (tabs) / 宫格 (grid) / 分组 (grouped) ---- */
+  #layoutsw {
+    display: flex; flex: 0 0 auto; border: 1px solid var(--border);
+    border-radius: 7px; overflow: hidden;
+  }
+  #layoutsw button {
+    background: transparent; border: 0; border-left: 1px solid var(--border);
+    color: var(--muted); font-size: 12px; padding: 4px 10px; cursor: pointer;
+  }
+  #layoutsw button:first-child { border-left: 0; }
+  #layoutsw button:hover { color: var(--text); }
+  #layoutsw button.on { background: var(--accent); color: #08130f; font-weight: 600; }
+  #gridcols {
+    display: none; flex: 0 0 auto; font-size: 12px; padding: 3px 6px;
+    background: var(--panel); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 7px;
+  }
+  #gridcols.show { display: block; }
 
   /* ---- left navigation: opencode sessions ---- */
   #shell { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -82,7 +107,43 @@
   .nav-list::-webkit-scrollbar { width: 8px; }
   .nav-list::-webkit-scrollbar-thumb { background: #333a4f; border-radius: 4px; }
 
-  #work { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  #work { flex: 1 1 auto; display: flex; min-width: 0; min-height: 0; }
+  #workmain { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+  /* ---- group rail: 分组 layout only (auto groups from cwd / opencode dir) ---- */
+  #groups {
+    flex: 0 0 236px; display: flex; flex-direction: column; min-height: 0;
+    background: var(--panel); border-right: 1px solid var(--border);
+  }
+  #groups.hidden { display: none; }
+  .g-head {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); flex: 0 0 auto;
+  }
+  .g-title { font-size: 12px; color: var(--muted); letter-spacing: .4px; flex: 1; }
+  .g-count { font-size: 11px; color: var(--muted); flex: 0 0 auto; }
+  .g-list { flex: 1 1 auto; overflow-y: auto; padding: 6px; min-height: 0; }
+  .g-list::-webkit-scrollbar { width: 8px; }
+  .g-list::-webkit-scrollbar-thumb { background: #333a4f; border-radius: 4px; }
+  .g-item {
+    padding: 7px 9px; border-radius: 7px; cursor: pointer;
+    border: 1px solid transparent; user-select: none;
+  }
+  .g-item:hover { background: var(--tab-bg); border-color: var(--border); }
+  .g-item.active { border-color: var(--accent); background: var(--tab-bg); }
+  .g-name {
+    font-size: 13px; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .g-meta {
+    font-size: 11px; color: var(--muted); margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .g-info { padding: 14px 10px; font-size: 12px; color: var(--muted); text-align: center; line-height: 1.6; }
+  .g-foot {
+    padding: 6px 12px; border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--muted); flex: 0 0 auto;
+  }
 
   /* ---- tab bar ---- */
   #tabbar {
@@ -120,12 +181,40 @@
     background: transparent; color: var(--muted); font-size: 16px; cursor: pointer;
   }
   #newtab:hover { color: var(--accent); border-color: var(--accent); }
+  /* overflow bucket: the tabs that do not fit (and, in 分组 layout, the other
+     groups' terminals) are listed behind this button */
+  #tabmore {
+    display: none; flex: 0 0 auto; margin-left: 6px; margin-bottom: 5px;
+    height: 26px; padding: 0 9px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--tab-bg);
+    color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  #tabmore.show { display: inline-block; }
+  #tabmore:hover { color: var(--accent); border-color: var(--accent); }
 
   /* ---- terminal panes ---- */
   #panes { flex: 1 1 auto; position: relative; background: var(--bg); min-height: 0; }
   .pane { position: absolute; inset: 12px; display: none; flex-direction: column; }
   .pane.on { display: flex; }              /* visibility (single mode: the focused pane) */
   .pane.active { /* focused pane; ring only applies inside a split */ }
+
+  /* ---- 宫格 layout: every terminal gets a grid cell (no tab switching) ---- */
+  #panes.grid-mode {
+    display: grid; gap: 10px; padding: 10px; overflow: auto;
+    grid-auto-rows: minmax(140px, 1fr);
+  }
+  #panes.grid-mode .pane {
+    position: relative; inset: auto; display: none;
+    min-width: 0; min-height: 0; padding: 8px; overflow: hidden;
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  #panes.grid-mode .pane.on { display: flex; }
+  #panes.grid-mode .pane.active {
+    border-color: var(--accent); box-shadow: 0 0 0 1px rgba(25, 169, 123, .35);
+  }
+  #panes.grid-mode .pane-tools { padding-bottom: 4px; }
+  /* no splitting in 宫格 / 分组: the layout itself decides where panes go */
+  #panes.grid-mode .split-tool, #panes.group-mode .split-tool { display: none; }
   .pane-term { flex: 1 1 auto; min-height: 0; position: relative; }
   .xterm { height: 100%; }
   .xterm .xterm-viewport { background: transparent !important; scrollbar-width: thin; }
@@ -204,6 +293,7 @@
     color: var(--text); font-size: 13px; cursor: pointer;
   }
   .ctxmenu button:hover { background: var(--accent); color: #fff; }
+  .ctxmenu button.head { color: var(--muted); font-size: 11px; padding: 4px 12px 2px; }
   .ctxmenu button.danger { color: var(--danger); }
   .ctxmenu button.danger:hover { background: var(--danger); color: #fff; }
   .ctxmenu .sep { height: 1px; background: var(--border); margin: 4px 6px; }
@@ -256,8 +346,20 @@
   <div class="logo">▚ Web Terminal <small>multi-tab</small></div>
   <button id="navtoggle" title="显示 / 隐藏左侧会话导航">☰ 会话</button>
   <span id="status">连接中…</span>
+  <div id="layoutsw" title="终端布局（Alt+L 循环切换）">
+    <button type="button" data-mode="tabs" title="横排标签：标签超出宽度时自动收进「⋯ 其他终端」下拉">横排</button>
+    <button type="button" data-mode="grid" title="宫格平铺：所有终端自动网格排列，点哪格哪格聚焦（Alt+1..9 或标签栏切换）">宫格</button>
+    <button type="button" data-mode="grouped" title="分组：按终端所在目录 / opencode 会话自动分组，左栏选组，标签栏只显示该组">分组</button>
+  </div>
+  <select id="gridcols" title="宫格列数">
+    <option value="0">自动列数</option>
+    <option value="1">1 列</option>
+    <option value="2">2 列</option>
+    <option value="3">3 列</option>
+    <option value="4">4 列</option>
+  </select>
   <div class="spacer"></div>
-  <div class="hint">+ 新建 · Alt+N/W · Ctrl+C 复制选区 · Ctrl+V 粘贴 · 右键「复制全部输出」 · TUI 内 Shift+拖选 · 🖼 上传图片：也可拖拽 / 粘贴 · ◫ 分屏：右键选方向 / 拖标签到面板边缘 / 拖中间分隔条调宽度</div>
+  <div class="hint">+ 新建 · Alt+N/W · Alt+L 切布局 · Alt+1..9 切终端 · Ctrl+C 复制选区 · Ctrl+V 粘贴 · 右键「复制全部输出」 · TUI 内 Shift+拖选 · 🖼 上传图片：也可拖拽 / 粘贴 · ◫ 分屏：右键选方向 / 拖标签到面板边缘 / 拖中间分隔条调宽度</div>
 </header>
 
 <div id="shell">
@@ -273,13 +375,25 @@
   </aside>
 
   <div id="work">
-    <div id="tabbar">
-      <button id="newtab" title="新建终端 (Alt+N)">+</button>
-    </div>
-    <div id="panes">
-      <div id="empty-hint">
-        <div>还没有打开的终端</div>
-        <button onclick="newTab()">打开一个终端</button>
+    <aside id="groups" class="hidden">
+      <div class="g-head">
+        <span class="g-title">终端分组</span>
+        <span class="g-count" id="g-count"></span>
+      </div>
+      <div class="g-list" id="g-list"></div>
+      <div class="g-foot" id="g-foot">按终端所在目录自动分组</div>
+    </aside>
+
+    <div id="workmain">
+      <div id="tabbar">
+        <button id="tabmore" title="显示其余终端">⋯</button>
+        <button id="newtab" title="新建终端 (Alt+N)">+</button>
+      </div>
+      <div id="panes">
+        <div id="empty-hint">
+          <div>还没有打开的终端</div>
+          <button onclick="newTab()">打开一个终端</button>
+        </div>
       </div>
     </div>
   </div>

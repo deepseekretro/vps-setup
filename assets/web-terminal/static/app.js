@@ -13,6 +13,12 @@
   var newTabBtn = document.getElementById('newtab');
   var statusEl = document.getElementById('status');
   var emptyHint = document.getElementById('empty-hint');
+  var tabMoreBtn = document.getElementById('tabmore');
+  var layoutSwEl = document.getElementById('layoutsw');
+  var gridColsEl = document.getElementById('gridcols');
+  var groupsEl = document.getElementById('groups');
+  var gListEl = document.getElementById('g-list');
+  var gCountEl = document.getElementById('g-count');
 
   var LS_KEY = 'webterm.tabs.v1';
   var ws = null;
@@ -395,6 +401,7 @@
       setStatus('已连接', true);
       flushOutbox();
       attachAll();                                   // re-attach every tab
+      requestCwds();                                 // keep 分组's directory map warm
     };
 
     ws.onclose = function () {
@@ -429,6 +436,10 @@
           navStatusEl.textContent = '删除失败：' + (m.error || '未知错误');
           toast('删除失败：' + (m.error || '未知错误'));
         }
+        return;
+      }
+      if (m.type === 'cwds') {                        // 分组: where each shell is
+        applyCwds(m.items || {}, m.home || '');
         return;
       }
       if (m.type === 'upload_done') {                 // image stored on the server
@@ -484,6 +495,7 @@
       t.title = m[1].trim();
       t.labelEl.textContent = t.title;
       saveTabs();
+      scheduleTabbar();                     // the label width changed
     }
   }
 
@@ -519,7 +531,7 @@
     tools.className = 'pane-tools';
     var splitBtn = document.createElement('button');
     splitBtn.type = 'button';
-    splitBtn.className = 'pane-tool';
+    splitBtn.className = 'pane-tool split-tool';    // hidden in 宫格 / 分组 layouts
     splitBtn.textContent = '◫ 分屏';
     splitBtn.title = '把这块区域一分为二（也可右键终端选方向，或把标签拖到某个面板的边缘）';
     splitBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
@@ -560,11 +572,13 @@
     var t = {
       term: null, fit: null, pane: pane, tabEl: tabEl, labelEl: label,
       n: n, alive: true, title: opts.title || '', userTitled: !!opts.userTitled,
-      ocId: opts.ocId || null, _rt: null, upBtn: upBtn, attaching: false
+      ocId: opts.ocId || null, _rt: null, upBtn: upBtn, attaching: false,
+      cwd: '',                                        // filled in by the server
+      gkey: (layoutMode === 'grouped') ? curGroup : '' // 分组: until cwd is known
     };
     tabEl.addEventListener('click', function (e) { if (e.target !== close) activate(id); });
     close.addEventListener('click', function (e) { e.stopPropagation(); closeTab(id); });
-    tabbar.insertBefore(tabEl, newTabBtn);
+    tabbar.insertBefore(tabEl, tabMoreBtn);
     wireTabDrag(t, id, close);
 
     // clicking anywhere inside a pane focuses it (matters in split view)
@@ -605,6 +619,7 @@
     term.attachCustomKeyEventHandler(function (ev) {
       if (ev.type !== 'keydown') return true;
       if (ev.altKey && (ev.key === 'w' || ev.key === 'W')) { closeTab(id); return false; }
+      if (handleLayoutKey(ev)) return false;         // Alt+L / Alt+1..9 stay here
       var action = (window.WTKeymap && window.WTKeymap.decide)
         ? window.WTKeymap.decide(ev, term.hasSelection())
         : null;
@@ -677,6 +692,8 @@
       activate(id);
       term.focus();
     }
+    if (layoutMode === 'grouped') { renderGroups(); requestCwds(); }
+    scheduleTabbar();
     return id;
   }
 
@@ -685,7 +702,7 @@
   function activate(id) {
     var t = tabs.get(id);
     if (!t) return;
-    if (layoutTree && !treeHas(layoutTree, id)) {
+    if (layoutMode === 'tabs' && layoutTree && !treeHas(layoutTree, id)) {
       // split view: the tab is not on stage — show it in place of the focused
       // (or first) pane; the pane it replaces stays alive as a normal tab
       var anchor = (activeId && tabs.has(activeId) && treeHas(layoutTree, activeId))
@@ -696,15 +713,21 @@
       }
     }
     activeId = id;
+    if (layoutMode === 'grouped') {            // following a tab follows its group
+      curGroup = groupKeyOf(id);
+      groupFocus[curGroup] = id;
+      syncGroupsActive();
+    }
     tabs.forEach(function (tt, tid) {
       tt.pane.classList.toggle('active', tid === id);
       tt.tabEl.classList.toggle('active', tid === id);
     });
-    if (!layoutTree) {
-      syncPaneVisibility();                    // single mode: visibility follows focus
+    if (layoutMode !== 'tabs' || !layoutTree) {
+      syncPaneVisibility();                    // single / grid / grouped: focus decides
     } else {
       refitVisibleSoon();                      // a swapped-in pane may need re-measuring
     }
+    scheduleTabbar();                          // the focused tab must stay in the strip
     saveLayout();                              // remember focus across refreshes too
     requestAnimationFrame(function () {
       var ct = tabs.get(id);
@@ -737,7 +760,12 @@
     }
     if (wasActive) {
       var next = null;
-      tabs.forEach(function (_, tid) { next = tid; });
+      if (layoutMode === 'grouped') {          // stay inside the group we were in
+        var ids = tabbarIds();
+        var back = groupFocus[curGroup];
+        next = (back && tabs.has(back)) ? back : (ids[0] || null);
+      }
+      if (!next) tabs.forEach(function (_, tid) { next = tid; });
       if (next) activate(next);
     }
   }
@@ -850,35 +878,61 @@
       t.pane.style.flexBasis = '';
       t.pane.style.flexShrink = '';
     });
-    if (layoutTree) panes.appendChild(buildSplitDOM(layoutTree));
+    panes.classList.toggle('grid-mode', layoutMode === 'grid');
+    panes.classList.toggle('group-mode', layoutMode === 'grouped');
+    if (layoutMode === 'grid') applyGrid();
+    else if (layoutMode === 'tabs' && layoutTree) panes.appendChild(buildSplitDOM(layoutTree));
+    orderPanes();
+    // Entering 分组 (or closing the last tab of the selected group) must never
+    // leave the stage showing a terminal from another group.
+    if (layoutMode === 'grouped') { renderGroups(); syncGroupSelection(); }
     syncPaneVisibility();
+    scheduleTabbar();
+  }
+
+  // DOM order = tab order (unless a split tree already owns the panes).
+  function orderPanes() {
+    if (layoutMode === 'tabs' && layoutTree) return;
+    tabs.forEach(function (t) { panes.appendChild(t.pane); });
+  }
+
+  // Which panes should be on screen right now.
+  function visibleIds() {
+    var on = Object.create(null);
+    if (!tabs.size) return on;
+    if (layoutMode === 'grid') {                       // every terminal at once
+      tabs.forEach(function (t, id) { on[id] = true; });
+      return on;
+    }
+    if (layoutMode === 'grouped') {                    // one terminal per group
+      if (activeId && tabs.has(activeId)) on[activeId] = true;
+      return on;
+    }
+    if (layoutTree) treeLeaves(layoutTree).forEach(function (lid) { on[lid] = true; });
+    else if (activeId) on[activeId] = true;
+    return on;
   }
 
   function syncPaneVisibility() {
-    var on = Object.create(null);
-    if (layoutTree) {
-      treeLeaves(layoutTree).forEach(function (lid) { on[lid] = true; });
-    } else if (activeId) {
-      on[activeId] = true;
-    }
+    var on = visibleIds();
+    var tiled = (layoutMode === 'tabs' && !!layoutTree);
     tabs.forEach(function (t, id) {
       var shown = !!on[id];
       t.pane.classList.toggle('on', shown);
-      t.pane.classList.toggle('in-split', !!(layoutTree && shown));
-      t.tabEl.classList.toggle('offstage', !!(layoutTree && !shown));
+      t.pane.classList.toggle('in-split', !!(tiled && shown));
+      t.tabEl.classList.toggle('offstage', !!(tiled && !shown));
       if (!shown) {
         t.pane.style.flexGrow = '';
         t.pane.style.flexBasis = '';
         t.pane.style.flexShrink = '';
       }
     });
-    if (layoutTree && (!activeId || !on[activeId])) {
+    if (tiled && (!activeId || !on[activeId])) {
       // focus fell off stage (e.g. its pane was removed): promote the first one
       var first = treeLeaves(layoutTree)[0];
       if (first && tabs.has(first)) { activeId = null; activate(first); return; }
     }
-    if (layoutTree) refitVisible();
-    else refitActive();
+    refitVisible();                                    // skips panes without ".on"
   }
 
   var fitRaf = 0;
@@ -985,7 +1039,8 @@
   // "+"/Alt+N: in split view a new terminal splits the focused area (wide ->
   // right, tall -> bottom); in single mode it is just the old plain new tab
   function createTabSmart() {
-    if (layoutTree && activeId && tabs.has(activeId) && treeHas(layoutTree, activeId)) {
+    if (layoutMode !== 'tabs' || !layoutTree) { createTab(); return; }
+    if (activeId && tabs.has(activeId) && treeHas(layoutTree, activeId)) {
       var r = tabs.get(activeId).pane.getBoundingClientRect();
       splitPane(activeId, r.width > r.height * 1.15 ? 'right' : 'bottom');
       return;
@@ -994,6 +1049,11 @@
   }
 
   function splitMenuItems(id) {
+    if (layoutMode !== 'tabs') {
+      return [['分屏要用「横排」布局（点顶部横排）', function () {
+        toast('切到「横排」布局后即可分屏');
+      }]];
+    }
     var items = [
       ['分屏到右侧', function () { splitPane(id, 'right'); }],
       ['分屏到下方', function () { splitPane(id, 'bottom'); }],
@@ -1128,6 +1188,359 @@
 
   window.addEventListener('blur', clearDropZone);
 
+  /* ---------------- layout modes: 横排 / 宫格 / 分组 ----------------
+   *
+   * tabs    : classic strip + one terminal on stage (draggable splits).
+   * grid    : every terminal gets a cell in an auto grid; click a cell to focus.
+   * grouped : terminals are grouped by the directory their shell sits in (or by
+   *           the directory of the opencode session they run), the rail picks a
+   *           group and the strip only shows that group's tabs.
+   *
+   * The split tree is only rendered in "tabs"; switching away keeps it in
+   * localStorage so coming back restores the same arrangement.
+   */
+
+  var MODE_KEY = 'webterm.layoutmode.v1';
+  var GRIDCOL_KEY = 'webterm.gridcol.v1';
+  var GROUP_KEY = 'webterm.navgroup.v1';
+  var LAYOUT_MODES = ['tabs', 'grid', 'grouped'];
+  var MODE_LABEL = { tabs: '横排标签', grid: '宫格平铺', grouped: '按目录分组' };
+  var TAB_MORE_W = 76;                    // width reserved for the "⋯ n" button
+  var CWDS_MS = 5000;                     // how often grouped mode re-asks for cwds
+
+  var layoutMode = 'tabs';
+  var gridCols = 0;                       // 0 = pick columns automatically
+  var curGroup = null;                    // selected group key (grouped mode)
+  var groupFocus = Object.create(null);   // group key -> last focused tab id
+  var tabMoreList = [];                   // ids the strip could not show
+  var HOME_DIR = '';
+  var tabbarRaf = 0;
+  var cwdsTimer = 0;
+
+  function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, val) { try { localStorage.setItem(key, val); } catch (e) { /* ignore */ } }
+
+  // "#layout=grid&cols=2" picks a layout for this visit only (bookmarks, tests):
+  // it never touches the saved preference.
+  function hashVal(re) {
+    var m = re.exec(location.hash || '');
+    return m ? m[1] : null;
+  }
+
+  function navItemById(sid) {
+    for (var i = 0; i < navState.items.length; i++) {
+      if (navState.items[i].id === sid) return navState.items[i];
+    }
+    return null;
+  }
+
+  /* ---- 分组: which group does a tab belong to ---- */
+
+  function groupKeyOf(id) {
+    var t = tabs.get(id);
+    if (!t) return '';
+    if (t.ocId) {                                     // tied to an opencode session
+      var it = navItemById(t.ocId);
+      if (it && it.directory) return it.directory;
+    }
+    if (t.cwd) return t.cwd;                          // where its shell really is
+    return (t.gkey === undefined || t.gkey === null) ? '' : t.gkey;
+  }
+
+  function groupLabelOf(key) {
+    if (!key) return '未分组';
+    if (HOME_DIR && key === HOME_DIR) return '~ (home)';
+    var parts = String(key).split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : key;
+  }
+
+  function builtGroups() {
+    var map = Object.create(null), order = [];
+    tabs.forEach(function (t, id) {
+      var k = groupKeyOf(id);
+      if (!map[k]) { map[k] = { key: k, label: groupLabelOf(k), ids: [] }; order.push(k); }
+      map[k].ids.push(id);
+    });
+    var gs = order.map(function (k) { return map[k]; });
+    gs.sort(function (a, b) {
+      if (!a.key !== !b.key) return a.key ? -1 : 1;   // 未分组 always last
+      return a.label.localeCompare(b.label);
+    });
+    return gs;
+  }
+
+  function ensureGroup() {
+    var gs = builtGroups();
+    if (!gs.length) { curGroup = null; return gs; }
+    var has = function (k) {
+      for (var i = 0; i < gs.length; i++) if (gs[i].key === k) return true;
+      return false;
+    };
+    if (!has(curGroup)) {
+      // nothing remembered (or that group is gone): stay with the terminal the
+      // user was just looking at, which is far less surprising than "第一组"
+      var mine = (activeId && tabs.has(activeId)) ? groupKeyOf(activeId) : null;
+      curGroup = has(mine) ? mine : gs[0].key;
+    }
+    return gs;
+  }
+
+  function renderGroups() {
+    var gs = ensureGroup();
+    gListEl.innerHTML = '';
+    gCountEl.textContent = gs.length ? gs.length + ' 组' : '';
+    if (!gs.length) {
+      var info = document.createElement('div');
+      info.className = 'g-info';
+      info.textContent = '还没有终端';
+      gListEl.appendChild(info);
+      return;
+    }
+    gs.forEach(function (g) {
+      var row = document.createElement('div');
+      row.className = 'g-item' + (g.key === curGroup ? ' active' : '');
+      row.dataset.key = g.key;
+      row.title = (g.key || '未分组') + '\n' + g.ids.length + ' 个终端';
+      var nameEl = document.createElement('div');
+      nameEl.className = 'g-name';
+      nameEl.textContent = g.label;
+      var metaEl = document.createElement('div');
+      metaEl.className = 'g-meta';
+      metaEl.textContent = g.ids.length + ' 个终端' + (g.key ? ' · ' + g.key : '');
+      row.append(nameEl, metaEl);
+      row.addEventListener('click', function () { selectGroup(g.key); });
+      gListEl.appendChild(row);
+    });
+  }
+
+  function syncGroupsActive() {
+    Array.prototype.forEach.call(gListEl.children, function (row) {
+      if (!row.dataset || row.dataset.key === undefined) return;
+      row.classList.toggle('active', row.dataset.key === curGroup);
+    });
+  }
+
+  // Ids the strip is allowed to show (in tab order).
+  function tabbarIds() {
+    var ids = [];
+    tabs.forEach(function (t, id) { ids.push(id); });
+    if (layoutMode !== 'grouped') return ids;
+    ensureGroup();
+    return ids.filter(function (id) { return groupKeyOf(id) === curGroup; });
+  }
+
+  function selectGroup(key) {
+    curGroup = key;
+    lsSet(GROUP_KEY, key);
+    syncGroupsActive();
+    var ids = tabbarIds();
+    var next = (activeId && ids.indexOf(activeId) >= 0) ? activeId : null;
+    if (!next && groupFocus[key] && ids.indexOf(groupFocus[key]) >= 0) next = groupFocus[key];
+    if (!next) next = ids[0] || null;
+    if (next) activate(next); else syncPaneVisibility();
+    scheduleTabbar();
+  }
+
+  // Membership changed underneath us (cwd / opencode list): keep a live focus.
+  function syncGroupSelection() {
+    ensureGroup();
+    var ids = tabbarIds();
+    if (activeId && ids.indexOf(activeId) >= 0) return;
+    var next = (groupFocus[curGroup] && ids.indexOf(groupFocus[curGroup]) >= 0)
+      ? groupFocus[curGroup] : (ids[0] || null);
+    if (next) activate(next);
+  }
+
+  /* ---- 宫格 ---- */
+
+  function gridColumnCount(n) {
+    if (gridCols > 0) return Math.max(1, Math.min(gridCols, n));
+    if (n <= 1) return 1;
+    if (n === 2) return 2;
+    return Math.min(4, Math.ceil(Math.sqrt(n)));
+  }
+
+  function applyGrid() {
+    var n = tabs.size;
+    if (!n) { panes.style.gridTemplateColumns = ''; return; }
+    var c = gridColumnCount(n);
+    panes.style.gridTemplateColumns = 'repeat(' + c + ', minmax(0, 1fr))';
+    panes.dataset.cols = String(c);                  // handy when debugging
+  }
+
+  /* ---- tab strip: what fits stays, the rest goes behind "⋯ n" ---- */
+
+  function scheduleTabbar() {
+    if (tabbarRaf) return;
+    tabbarRaf = requestAnimationFrame(function () { tabbarRaf = 0; applyTabbar(); });
+  }
+
+  function tabLabelOf(id) {
+    var t = tabs.get(id);
+    if (!t) return '';
+    return (t.n ? t.n + '. ' : '') + (t.labelEl.textContent || '终端')
+         + (t.alive ? '' : '（已结束）');
+  }
+
+  function applyTabbar() {
+    var allowed = Object.create(null);
+    tabbarIds().forEach(function (id) { allowed[id] = 1; });
+
+    var cands = [];
+    tabs.forEach(function (t, id) {
+      var inBar = !!allowed[id];
+      t.tabEl.style.display = inBar ? '' : 'none';
+      if (inBar) cands.push(id);
+    });
+
+    var widths = cands.map(function (id) { return tabs.get(id).tabEl.offsetWidth + 3; });
+    var total = widths.reduce(function (a, b) { return a + b; }, 0);
+    var avail = tabbar.clientWidth - 30 - newTabBtn.offsetWidth - 8;
+    var hidden = Object.create(null);
+    if (total > avail) {
+      avail -= TAB_MORE_W;                           // the button we are about to show
+      for (var i = cands.length - 1; i >= 0 && total > avail; i--) {
+        if (cands[i] === activeId) continue;         // never hide the focused tab
+        hidden[cands[i]] = 1;
+        total -= widths[i];
+      }
+    }
+    var dropped = [];
+    cands.forEach(function (id) {
+      if (hidden[id]) { tabs.get(id).tabEl.style.display = 'none'; dropped.push(id); }
+    });
+    var outside = [];
+    tabs.forEach(function (t, id) { if (!allowed[id]) outside.push(id); });
+
+    tabMoreList = dropped.concat(outside);
+    var n = tabMoreList.length;
+    tabMoreBtn.classList.toggle('show', !!n);
+    tabMoreBtn.textContent = '⋯' + (n ? ' ' + n : '');
+    tabMoreBtn.title = n ? n + ' 个终端未显示（点击查看 / 切换）' : '';
+  }
+
+  function showTabMoreMenu() {
+    var r = tabMoreBtn.getBoundingClientRect();
+    var byGroup = Object.create(null), order = [];
+    tabMoreList.forEach(function (id) {
+      var g = (layoutMode === 'grouped') ? groupKeyOf(id) : '';
+      if (!byGroup[g]) { byGroup[g] = []; order.push(g); }
+      byGroup[g].push(id);
+    });
+    var items = [];
+    order.forEach(function (g) {
+      var ids = byGroup[g];
+      if (layoutMode === 'grouped' && g !== curGroup) {
+        items.push([groupLabelOf(g) + '（' + ids.length + '）',
+          (function (k) { return function () { selectGroup(k); }; })(g), 'head']);
+      }
+      ids.forEach(function (id) {
+        var mark = (id === activeId) ? '✓ ' : '';
+        items.push([mark + tabLabelOf(id),
+          (function (i) { return function () { activate(i); }; })(id)]);
+      });
+    });
+    if (!items.length) return;
+    openMenu(r.left, r.bottom + 6, items);
+  }
+
+  /* ---- mode plumbing ---- */
+
+  function setLayoutMode(mode, quiet) {
+    if (LAYOUT_MODES.indexOf(mode) < 0) mode = 'tabs';
+    layoutMode = mode;
+    Array.prototype.forEach.call(layoutSwEl.children, function (b) {
+      b.classList.toggle('on', b.dataset.mode === mode);
+    });
+    groupsEl.classList.toggle('hidden', mode !== 'grouped');
+    gridColsEl.classList.toggle('show', mode === 'grid');
+    if (mode === 'grouped') { ensureGroup(); requestCwds(); }
+    renderLayout();
+    if (!quiet) toast('布局：' + MODE_LABEL[mode]);
+  }
+
+  function chooseLayoutMode(mode) {
+    lsSet(MODE_KEY, mode);
+    setLayoutMode(mode);
+  }
+
+  function cycleLayout() {
+    var i = LAYOUT_MODES.indexOf(layoutMode);
+    chooseLayoutMode(LAYOUT_MODES[(i + 1) % LAYOUT_MODES.length]);
+  }
+
+  function focusNthTab(n) {
+    var ids = tabbarIds();
+    if (ids[n - 1]) activate(ids[n - 1]);
+  }
+
+  // Alt+L / Alt+1..9 are claimed BEFORE xterm sees them, otherwise the shell
+  // would also receive M-l / M-1 (readline: downcase-word / digit-argument).
+  // The document listener below picks up the same event only when a terminal
+  // did not already handle it (e.g. focus is on a button).
+  function handleLayoutKey(ev) {
+    if (!ev.altKey || ev.ctrlKey || ev.metaKey) return false;
+    var k = ev.key || '';
+    if (k === 'l' || k === 'L') { ev.__wtHandled = true; cycleLayout(); return true; }
+    if (k >= '1' && k <= '9') {
+      ev.__wtHandled = true;
+      focusNthTab(parseInt(k, 10));
+      return true;
+    }
+    return false;
+  }
+
+  function requestCwds() { sendMsg({ type: 'cwds' }); }
+
+  function applyCwds(items, home) {
+    if (home) HOME_DIR = home;
+    var changed = false;
+    tabs.forEach(function (t, id) {
+      var c = items[id] || '';
+      if (c !== (t.cwd || '')) { t.cwd = c; changed = true; }
+    });
+    if (!changed) return;
+    if (layoutMode === 'grouped') { renderGroups(); syncGroupSelection(); }
+    scheduleTabbar();
+  }
+
+  function initLayout() {
+    var hMode = hashVal(/(?:^|[#&])layout=(tabs|grid|grouped)\b/);
+    var hCols = hashVal(/(?:^|[#&])cols=([0-4])\b/);
+    var sCols = parseInt(lsGet(GRIDCOL_KEY) || '0', 10);
+    gridCols = (hCols !== null) ? parseInt(hCols, 10) : (isNaN(sCols) ? 0 : sCols);
+    gridColsEl.value = String(gridCols);
+    var savedGroup = lsGet(GROUP_KEY);
+    curGroup = (savedGroup === null) ? null : savedGroup;
+
+    Array.prototype.forEach.call(layoutSwEl.children, function (b) {
+      b.addEventListener('click', function () { chooseLayoutMode(b.dataset.mode); });
+    });
+    gridColsEl.addEventListener('change', function () {
+      gridCols = parseInt(gridColsEl.value, 10) || 0;
+      lsSet(GRIDCOL_KEY, String(gridCols));
+      if (layoutMode === 'grid') renderLayout();
+    });
+    tabMoreBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      showTabMoreMenu();
+    });
+
+    document.addEventListener('keydown', function (e) {
+      if (e.__wtHandled) return;                   // a terminal already did it
+      if (handleLayoutKey(e)) e.preventDefault();
+    });
+
+    cwdsTimer = setInterval(function () {
+      if (layoutMode === 'grouped' && !document.hidden) requestCwds();
+    }, CWDS_MS);
+    window.addEventListener('focus', function () {
+      if (layoutMode === 'grouped') requestCwds();
+    });
+
+    setLayoutMode(hMode || lsGet(MODE_KEY) || 'tabs', true);
+  }
+
   /* ---------------- left navigation: opencode sessions ---------------- */
 
 
@@ -1226,6 +1639,10 @@
     navStatusEl.textContent = items.length + ' 个会话 · 更新于 '
       + pad2(now.getHours()) + ':' + pad2(now.getMinutes());
     syncNavActive();
+    // A tab running an opencode session is grouped by that session's directory,
+    // which only this list knows: refresh the rail (and the strip) after it changes.
+    if (layoutMode === 'grouped') { renderGroups(); syncGroupSelection(); }
+    scheduleTabbar();
   }
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
@@ -1386,13 +1803,6 @@
     requestSessions(true);                           // this session jumps to the top
   }
 
-  function refitActive() {
-    var t = activeId && tabs.get(activeId);
-    if (!t || !t.fit) return;
-    try { t.fit.fit(); } catch (e) { /* ignore */ }
-    scheduleResize(activeId);
-  }
-
   function setNavVisible(v) {
     navState.visible = !!v;
     navEl.classList.toggle('hidden', !navState.visible);
@@ -1404,6 +1814,7 @@
       refitVisible();
       setTimeout(refitVisible, 90);
     });
+    scheduleTabbar();
   }
 
   function initNav() {
@@ -1446,6 +1857,7 @@
   window.addEventListener('resize', function () {
     // hidden panes cannot be measured by xterm: fit every visible pane only
     refitVisibleSoon();
+    scheduleTabbar();                          // fewer/more tabs fit after a resize
   });
   window.addEventListener('beforeunload', function () {
     try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch (e) { /* ignore */ }
@@ -1455,7 +1867,8 @@
   document.addEventListener('dragover', function (e) { e.preventDefault(); });
   document.addEventListener('drop', function (e) { e.preventDefault(); });
 
-  initNav();
+  initLayout();                                // before the restore loop: tabs land
+  initNav();                                   // in the right layout right away
   connect();
 
   var stored = loadStored();
