@@ -204,3 +204,55 @@ gstreamer 插件链 —— 同一批依赖在旧安装里实测约 300 MiB。）
 - 会话自启动那 6 行（面板 / 桌面图标 / 剪贴板×2 / 输入法 / 防息屏）统一由
   `ensure_session_autostart` 幂等维护，不再在加固步骤和流水线步骤里各写一遍；
   noVNC 补丁函数也不再顺手去调 `silence_desktop_bins`（职责错位）。
+
+## Web Terminal 网页终端（`g. Web Terminal 网页终端`）
+
+`scripts/webterm_setup.sh` 把「浏览器里的多标签终端」做成一键模块：后端是一个
+Python `asyncio` 的 PTY ⇄ WebSocket 桥（`/var/www/web-terminal/app.py`，只监听
+`127.0.0.1:9000`），前端是 xterm.js 多标签界面，外面套一层 OpenResty/Nginx
+反向代理 + 整站 basic auth。**可以在 LXC 容器内运行**（VPS 上很常见）。
+
+```bash
+sudo bash scripts/webterm_setup.sh                 # 交互菜单
+sudo bash scripts/webterm_setup.sh --install       # 安装 / 更新
+sudo bash scripts/webterm_setup.sh --status        # 状态（只读，不改配置）
+sudo bash scripts/webterm_setup.sh --reset-password
+```
+
+安装内容与落盘位置：
+
+| 位置 | 说明 |
+| --- | --- |
+| `/var/www/web-terminal/app.py`、`static/` | 后端 + 前端（来自仓库 `assets/web-terminal/`） |
+| `/etc/systemd/system/webterminal.service` | 后端服务（`Restart=on-failure`，`TERM_PORT` 记在单元里） |
+| `<conf>/conf.d/10-webterm.conf` | **脚本自有**的站点（http + https 两个 `server`，可反复覆盖） |
+| `<conf>/webterm-server.inc` | 站点本体，被上面两个 `server` 一起 `include` |
+| `<conf>/htpasswd` | basic auth 用户文件（已存在则沿用你的） |
+| `/root/.webterm-credentials` | 明文访问密码记录（`600`，**绝不进仓库**），菜单 `[2]/[3]` 读写 |
+
+**和 noVNC 模块同一套「增量」原则，绝不覆盖你已有的 nginx**：
+
+- **只写自己的两个文件**：`conf.d/10-webterm.conf` 与 `webterm-server.inc`；
+  你的 `nginx.conf` 只在「内部完全没有会加载到 `conf.d` 的 `include`」时才补插 1 行
+  带标记的 `include <conf.d>/*.conf;`（插前备份到 `nginx.conf.vps-setup-webterm.bak`）。
+- **检测到你已经手写过 Web Terminal 站点就不动 nginx**：判据是「某个配置文件里同时有
+  `proxy_pass …127.0.0.1:<后端端口>` 和 `/ws`（或 webterm 字样）」。此时只更新
+  应用 / 服务 / 密码，配置一个字都不改，并打印命中的文件。
+- **靠标记区分「谁的文件」，不靠文件名**：脚本生成的文件都带
+  `# Managed by vps-setup (webterm_setup.sh)` 注释；你手写的站点即使**恰好也叫
+  `webterm-server.inc`** 也不会被当成脚本的文件，更不会被覆盖 —— 真有同名且非脚本生成
+  的文件时，脚本会自动改用 `webterm-server.vps-setup.inc`。
+- **端口自动避让**：http 优先 `80`（被占则 `8080/8000/8888/9080`），https 优先 `443`
+  （被占则 `8443/9443/10443/12443`）；已装过就沿用 drop-in 里的端口，不会每次跳。
+- **先 `nginx -t` 再加载**：通过后 `-s reload` 平滑加载；失败自动回滚（删/恢复 drop-in、
+  恢复主配置备份），**绝不会让你的站点起不来**。
+- **不改你已有的密码**：`htpasswd` 里已有同名用户、而脚本记录里没有明文密码时，保持原样
+  并提示「明文未记录，可到 `[3]` 重设」；只有真的没有才随机生成 14 位密码并打印。
+  重跑本模块也不会改密码（会按 salt 重新哈希核对一遍）。
+
+访问：装完打印 `https://IP/`（自签证书需点一次「继续访问」）。后端以 **root** 身份
+开 shell，所以整站强制 basic auth + HTTPS；容器里要外部访问请自行在宿主做端口转发。
+
+前端资源 xterm.js / xterm-addon-fit 为 MIT 许可（随仓库 `assets/web-terminal/static/vendor/`
+一起分发，无需联网 CDN）。卸载用菜单 `[4]`：停用并删除服务单元、删掉两个脚本自有配置文件、
+删掉应用目录与密码记录 —— **不碰你的 `nginx.conf` 和其它站点**。

@@ -589,6 +589,7 @@ show_help() {
     echo "  d. 宿主机配置 - ZRAM 压缩交换（LXC/物理宿主专用）"
     echo "  e. Hysteria2   - 节点安装/管理（宿主机专用，随机密码）"
     echo "  f. VNC桌面     - LXDE/Wine/Edge/noVNC/MT5（容器内自动跳过 swap）"
+    echo "  g. WebTerminal - 多标签网页终端（应用+OpenResty反代+basic auth）"
     echo "  1. 安全配置  - SSH密钥、防火墙、Fail2ban"
     echo "  2. 系统配置  - 主机名、时区、软件包管理"
     echo "  3. 监控查看  - 系统状态、日志查看"
@@ -672,6 +673,9 @@ show_main_menu() {
     echo "a. ☁️  Rclone 配置"
     echo "   (云存储挂载、配置管理)"
     echo ""
+    echo "g. ⌨️  Web Terminal 网页终端"
+    echo "   (多标签网页终端 + OpenResty 反代 + basic auth；容器内可用)"
+    echo ""
     echo "【桌面环境】"
     echo ""
     echo "f. 🖥️ VNC 桌面环境"
@@ -699,7 +703,7 @@ show_main_menu() {
 main_menu() {
     while true; do
         show_main_menu
-        read -p "请选择 [0-9/a-f/i/t/u/h]: " choice
+        read -p "请选择 [0-9/a-g/i/t/u/h]: " choice
         
         case $choice in
             d|D)
@@ -740,6 +744,9 @@ main_menu() {
                 ;;
             a|A)
                 run_subscript "rclone_setup"
+                ;;
+            g|G)
+                run_subscript "webterm_setup"
                 ;;
             b|B)
                 yabs_benchmark_menu
