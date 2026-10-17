@@ -89,6 +89,15 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
 - 恢复注销功能：`dpkg-divert --remove /usr/bin/lxde-logout`（`.real` 是原程序），
   并删除用户级 panel 配置后重启 `vnc-desktop@1`
 
+**分辨率热切换（免 root）**：桌面上的 `切换分辨率(Systemd版).sh` 只改写用户自己的
+`~/.vnc/display-1.conf`，再由 systemd 路径单元 `vnc-res-watch.path` 监听到变化后触发
+`vnc-res-apply@1.service`（root）重启 `xvfb@1`；**普通桌面用户双击即可生效，无需 sudo/密码**
+（旧实现是 `sudo bash "$0"`，在无密码桌面用户、或 setuid 位丢失的容器里会直接失败，
+表现就是"双击/在终端里跑都没反应"）。双击选择「执行」（无终端）时脚本会自动用 `lxterminal`
+重新拉起自己来显示菜单；`[6] 安装并激活流水线` 会自动安装并启用该 path 单元，
+也可用 `bash scripts/vnc_desktop_setup.sh --res-tool [用户名]` 单独刷新。
+注意：切换分辨率本质是重启 Xvfb，桌面会话会短暂重启，刷新 noVNC 网页即可。
+
 **精简安装**：所有 apt 安装均带 `--no-install-recommends`（避免推荐包带进
 zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等数百 MiB），
 中文字体只装体积更小的 `fonts-wqy-microhei`；Wine / Edge / Gost 保持独立菜单可选项，按需安装。

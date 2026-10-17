@@ -694,8 +694,46 @@ OOMScoreAdjust=-900
 WantedBy=multi-user.target
 EOF
 
+    # 8. 分辨率热切换：路径单元（免 root 触发器） + 应用单元（root 执行）
+    install_res_watch_units
+
     systemctl daemon-reload
     echo "✅ Systemd 级联服务单元部署就绪！"
+}
+
+# =======================================================
+# 分辨率热切换的「免 root」通道
+#   桌面工具只改写用户自己的 ~/.vnc/display-1.conf（本来就不需要特权），
+#   vnc-res-watch.path 监听到文件变化 → 触发 vnc-res-apply@1.service（root）
+#   → systemctl restart xvfb@1。这样桌面用户双击运行不再需要 sudo/密码。
+# =======================================================
+install_res_watch_units() {
+    cat > /etc/systemd/system/vnc-res-apply@.service << EOF
+[Unit]
+Description=Apply VNC display resolution change for Display :%i
+After=xvfb@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart xvfb@%i
+TimeoutStartSec=60
+EOF
+
+    cat > /etc/systemd/system/vnc-res-watch.path << EOF
+[Unit]
+Description=Watch ${USER_HOME}/.vnc/display-1.conf for resolution changes
+After=xvfb@1.service
+
+[Path]
+# 用 PathChanged（写入并关闭后触发），不会读到写了一半的配置
+PathChanged=${USER_HOME}/.vnc/display-1.conf
+Unit=vnc-res-apply@1.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
 }
 
 setup_mt5_watchdog_script() {
@@ -776,14 +814,26 @@ create_pipeline_res_tool() {
 
     cat > "${tool_path}" << 'EOF_TOOL'
 #!/bin/bash
-if [ "$EUID" -ne 0 ]; then
-    echo "正在请求管理员权限..."
-    sudo bash "$0"
-    exit
-fi
-
+# ------------------------------------------------------------------
+# 分辨率热切换工具（免 root 版）
+#   1) 只改写用户自己的 ~/.vnc/display-1.conf —— 本来就不需要特权
+#   2) systemd 路径单元 vnc-res-watch.path 监听到文件变化后，
+#      由 root 执行 vnc-res-apply@1.service → systemctl restart xvfb@1
+#   双击运行不再需要 sudo / 密码。
+# ------------------------------------------------------------------
 CONF="/home/CURRENT_VNC_USER_PLACEHOLDER/.vnc/display-1.conf"
 
+# 双击（没有终端）时自动用 lxterminal 重新打开自己，保证能选菜单、能看到结果
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    if command -v lxterminal >/dev/null 2>&1; then
+        exec lxterminal --title="切换分辨率" -e "bash \"$0\""
+    fi
+    echo "⚠️ 请在终端中运行本脚本（右键 → 在终端中执行）"
+    sleep 5
+    exit 1
+fi
+
+clear
 echo "=== Systemd 级联服务架构 - 分辨率切换工具 ==="
 echo " [1] 1920 x 1080 (1080P 标准全高清)"
 echo " [2] 1280 x 720  (720P 极简省流)"
@@ -811,12 +861,15 @@ DEPTH=24
 # EXTRA_XVFB_ARGS=""
 EOF
 
+echo ""
 echo "⚙️ 分辨率已保存为 ${W}x${H}。"
-echo "🔄 正在下发重启指令..."
-systemctl restart --no-block xvfb@1
-
-echo "✅ 重启任务已成功提交！桌面流水线将在后台重新加载（${W}x${H}），请在 3-5 秒后刷新网页连接。"
-sleep 1
+if systemctl is-active --quiet vnc-res-watch.path 2>/dev/null; then
+    echo "🔄 已通过 systemd 路径单元下发重启指令（无需密码）。"
+    echo "✅ 请 3-5 秒后刷新 noVNC 网页：桌面会话会短暂重启，属于正常现象。"
+else
+    echo "⚠️ 未检测到 vnc-res-watch.path，请手动执行: sudo systemctl restart xvfb@1"
+fi
+sleep 2
 EOF_TOOL
 
     sed -i "s/CURRENT_VNC_USER_PLACEHOLDER/${VNC_USER}/g" "${tool_path}"
@@ -945,6 +998,11 @@ activate_pipeline_services() {
     systemctl enable xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 vnc-stack@1.target mt5-watchdog@1 2>/dev/null || true
     systemctl restart vnc-stack@1.target
 
+    # 分辨率热切换的免 root 通道（路径单元监听 display-1.conf）
+    install_res_watch_units
+    systemctl enable vnc-res-watch.path 2>/dev/null || true
+    systemctl restart vnc-res-watch.path 2>/dev/null || true
+
     echo "=========================================================="
     echo "✅ Systemd 级联服务流水线已激活并开机自启！"
     echo "   - xvfb@1.service         (虚拟显存)"
@@ -952,6 +1010,7 @@ activate_pipeline_services() {
     echo "   - x11vnc@1.service       (VNC 传输协议)"
     echo "   - websockify@1.service   (WebSocket 网页桥接)"
     echo "   - mt5-watchdog@1.service (MT5 7*24 自动自愈)"
+    echo "   - vnc-res-watch.path     (分辨率热切换：桌面免密码触发)"
     echo "=========================================================="
 }
 
@@ -987,7 +1046,7 @@ main_menu() {
             7) create_edge_tool ;;
             8) install_gost_ipv6 ;;
             9) 
-                systemctl status xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 gost --no-pager
+                systemctl status xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 vnc-res-watch.path gost --no-pager
                 ;;
             99) 
                 systemctl stop vnc-stack@1.target xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 gost 2>/dev/null || true
@@ -1020,6 +1079,23 @@ if [ "${1:-}" = "--harden" ]; then
         update_variables
     fi
     harden_desktop_session
+    exit 0
+fi
+
+# 非交互入口：--res-tool [用户名]
+#   安装/刷新分辨率热切换的免 root 通道（vnc-res-watch.path）并重新生成桌面工具
+if [ "${1:-}" = "--res-tool" ]; then
+    check_root
+    if [ -n "${2:-}" ]; then
+        VNC_USER="$2"
+        update_variables
+    fi
+    install_res_watch_units
+    create_pipeline_res_tool
+    systemctl enable vnc-res-watch.path 2>/dev/null || true
+    systemctl restart vnc-res-watch.path 2>/dev/null || true
+    echo "✅ 免 root 分辨率通道就绪：vnc-res-watch.path"
+    echo "✅ 桌面工具已刷新：${DESKTOP_DIR}/切换分辨率(Systemd版).sh"
     exit 0
 fi
 
