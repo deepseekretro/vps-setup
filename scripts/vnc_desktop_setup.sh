@@ -1,0 +1,854 @@
+#!/bin/bash
+
+# =======================================================
+# 🚀 Debian 12 VNC - Systemd 级联服务架构版 (Pipeline Edition)
+# 核心架构：
+#   - xvfb@.service        (虚拟帧缓冲显存服务)
+#   - vnc-desktop@.service (LXDE 桌面会话，BindsTo=xvfb)
+#   - x11vnc@.service      (VNC 网络服务，BindsTo=xvfb)
+#   - websockify@.service  (WebSocket 网关服务)
+#   - vnc-stack@.target    (级联总调度单元)
+#   - mt5-watchdog@.service (MT5 交易软件 7*24 智能自愈守护)
+# 优势：
+#   1. 完全抛弃长脚本后台跑任务，各组件由 Systemd 独立追踪真实 PID
+#   2. BindsTo 强绑定：任何核心组件崩溃，整个链路安全平滑重启，杜绝黑屏假死
+#   3. 独立服务日志：可通过 journalctl 精确追溯具体是桌面、显卡还是网络问题
+# =======================================================
+
+VNC_USER="vncuser1"
+SWAP_SIZE="2G"
+SWAP_FILE="/swapfile"
+
+update_variables() {
+    USER_HOME="/home/${VNC_USER}"
+    NOVNC_WEB_ROOT="/usr/share/novnc"
+    VNC_PASSWD_FILE="${USER_HOME}/.vnc/passwd"
+    VNC_CONF_DIR="${USER_HOME}/.vnc"
+    DESKTOP_DIR="${USER_HOME}/Desktop"
+
+    SSL_CERT_DIR="/etc/ssl/localcerts"
+    SSL_KEY="${SSL_CERT_DIR}/selfsigned.key"
+    SSL_CRT="${SSL_CERT_DIR}/selfsigned.crt"
+
+    PKG_LXDE="lxde-core lxterminal lxappearance lxde-icon-theme openbox pcmanfm lxpanel"
+    DBUS_PACKAGE="dbus-x11"
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then echo "❌ 请使用 root 权限运行"; exit 1; fi
+}
+
+configure_username() {
+    clear
+    echo "========================================"
+    echo "👤  VNC 运行用户配置 (权限隔离)"
+    echo "========================================"
+    echo "安全规范：VNC 桌面及 MT5 将以该特定普通用户权限安全隔离运行。"
+    echo "当前默认用户: ${VNC_USER}"
+    echo ""
+    read -p "请输入用户名 [回车默认: vncuser1]: " input_user
+
+    if [ ! -z "$input_user" ]; then
+        VNC_USER="$input_user"
+    fi
+
+    update_variables
+    echo "----------------------------------------"
+    echo "✅ 服务绑定用户: ${VNC_USER}"
+    echo "📂 用户主目录:   ${USER_HOME}"
+    echo "----------------------------------------"
+    sleep 1
+}
+
+# 检测是否运行在容器内（LXC/Docker/Podman/OpenVZ...），返回类型字符串
+#
+# 为什么容器内绝不能碰 swap：
+#   Linux 的 swap 不参与命名空间隔离 —— 容器里执行 swapon 会直接给【宿主机内核】
+#   添加/替换 swap 设备。在 LXC 里 a /swapfile 指向容器 rootfs（即宿主磁盘上的文件），
+#   一旦 swapon，宿主的 swap 就被容器改写了，属于跨边界的高危操作。
+detect_container() {
+    local t=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        t=$(systemd-detect-virt --container 2>/dev/null || true)
+        if [ -n "$t" ] && [ "$t" != "none" ]; then echo "$t"; return 0; fi
+    fi
+    if [ -f /run/systemd/container ] && [ -s /run/systemd/container ]; then
+        cat /run/systemd/container; return 0
+    fi
+    [ -f /.dockerenv ] && { echo "docker"; return 0; }
+    [ -d /proc/vz ] && [ -f /proc/vz/veinfo ] && { echo "openvz"; return 0; }
+    if grep -qaE '(^| )container=' /proc/1/environ 2>/dev/null; then
+        tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^container=//p' | head -1
+        return 0
+    fi
+    if grep -qaE 'lxc|docker|kubepods|containerd|podman|garden' /proc/1/cgroup 2>/dev/null; then
+        echo "unknown"; return 0
+    fi
+    return 1
+}
+
+setup_swap() {
+    echo "--- 检查 Swap ---"
+
+    local ctype=""
+    if ctype=$(detect_container); then
+        echo "ℹ️ 检测到容器环境（${ctype}），已跳过容器内 swapfile 的创建与启用。"
+        echo "   swap 统一由宿主机管理；容器内 swapon 会直接作用于宿主机内核（跨边界风险）。"
+        return 0
+    fi
+
+    # 已是活动 swap（不依赖 fstab 判断）—— 直接跳过，避免 fallocate 覆盖正在使用的 swap 文件
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "${SWAP_FILE}"; then
+        echo "✅ Swap 已激活（${SWAP_FILE}）。"
+        return 0
+    fi
+
+    if grep -q "${SWAP_FILE}" /etc/fstab; then
+        echo "✅ Swap 已在 /etc/fstab 中配置（${SWAP_FILE}）。"
+        if [ -f "${SWAP_FILE}" ]; then
+            swapon "${SWAP_FILE}" 2>/dev/null && echo "   已按 fstab 重新启用。" || true
+        fi
+        return 0
+    fi
+
+    echo "创建 Swap..."
+    fallocate -l ${SWAP_SIZE} ${SWAP_FILE}; chmod 600 ${SWAP_FILE}
+    mkswap ${SWAP_FILE}; swapon ${SWAP_FILE}
+    echo "${SWAP_FILE} none swap sw 0 0" >> /etc/fstab
+}
+
+setup_system_and_user_and_locale() {
+    echo "--- 1. 更新系统与基础依赖 ---"
+    setup_swap
+    apt update
+    apt install -y curl wget sudo gnupg2 sed locales xdg-user-dirs openssl haveged xvfb x11vnc unzip zip lsof apt-transport-https ca-certificates procps net-tools psmisc wmctrl xdotool autocutsel lsb-release x11-xserver-utils rtkit
+    mkdir -p /etc/pipewire && touch /etc/pipewire/client.conf
+
+    echo "--- 2. 安装中文字体 ---"
+    apt install -y fonts-wqy-microhei fonts-wqy-zenhei
+
+    echo "--- 3. 安装 Fcitx4 + Google 拼音 ---"
+    apt install -y fcitx fcitx-googlepinyin fcitx-ui-classic fcitx-config-gtk \
+                    fcitx-frontend-gtk2 fcitx-frontend-gtk3 fcitx-frontend-qt5 \
+                    dbus-x11 im-config libgtk2.0-bin libgtk-3-bin at-spi2-core
+
+    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+    echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen
+    locale-gen
+    update-locale LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8
+
+    timedatectl set-timezone Asia/Shanghai
+
+    # --- 用户创建与防误删选择 ---
+    local need_create_user=1
+    if id "${VNC_USER}" &>/dev/null; then 
+        echo "========================================"
+        echo "⚠️ 检测到用户 ${VNC_USER} 已存在！"
+        echo "========================================"
+        echo " [1] 保留现有数据（仅修复组权限，不删家目录）[默认]"
+        echo " [2] 彻底重置用户（清空家目录，重新生成纯净英文环境）"
+        read -p "请选择处理方式 [1/2, 默认 1]: " reset_choice
+        case "$reset_choice" in
+            2)
+                echo "⚠️ 正在彻底清理并重置用户 ${VNC_USER}..."
+                pkill -u "${VNC_USER}" 2>/dev/null || true
+                deluser --remove-home "${VNC_USER}" || true
+                need_create_user=1
+                ;;
+            *)
+                echo "ℹ️ 已选择保留现有用户 ${VNC_USER} 及全部数据。"
+                usermod -aG sudo ${VNC_USER}
+                need_create_user=0
+                ;;
+        esac
+    fi
+
+    if [ "$need_create_user" -eq 1 ]; then
+        echo "👤 创建服务用户 ${VNC_USER}..."
+        adduser --disabled-password --gecos "" --home ${USER_HOME} ${VNC_USER}
+        usermod -aG sudo ${VNC_USER}
+
+        echo "📁 正在强制生成英文基础目录..."
+        su - ${VNC_USER} -c "LC_ALL=C xdg-user-dirs-update --force"
+
+        mkdir -p ${USER_HOME}/Desktop ${USER_HOME}/.vnc ${USER_HOME}/.config/autostart
+        chown -R ${VNC_USER}:${VNC_USER} ${USER_HOME}
+
+        echo "🔑 设置用户 ${VNC_USER} 密码："
+        passwd ${VNC_USER}
+    fi
+
+    # 启用用户会话永久驻留（防止无 SSH 连接时被系统回收）
+    loginctl enable-linger ${VNC_USER} 2>/dev/null || true
+    su - ${VNC_USER} -c "im-config -n fcitx"
+    echo "✅ 系统与用户初始化完成。"
+}
+
+install_lxde_desktop() {
+    apt install -y --no-install-recommends ${PKG_LXDE} ${DBUS_PACKAGE}
+}
+
+install_wine_env() {
+    echo "--- 正在安装 Wine (64位 + 32位 全功能版) ---"
+    dpkg --add-architecture i386
+    apt update
+    apt install -y --no-install-recommends winetricks wine wine32 wine64 libwine libwine:i386 fonts-wine
+    chown -R ${VNC_USER}:${VNC_USER} ${USER_HOME}
+
+    echo "⚙️ 正在初始化 Wine 前缀..."
+    su - ${VNC_USER} -c "
+        export WINEPREFIX=${USER_HOME}/.wine
+        export WINEDEBUG=-all
+        xvfb-run -a wineboot --init >/dev/null 2>&1
+        xvfb-run -a winetricks -q fakechinese corefonts >/dev/null 2>&1
+    "
+
+    cat > /usr/local/bin/wine-cn <<EOF
+#!/bin/bash
+export LC_ALL=zh_CN.UTF-8
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export DISPLAY=:1
+wine "\$@"
+EOF
+    chmod +x /usr/local/bin/wine-cn
+    echo "✅ Wine 安装完成。"
+}
+
+install_edge_browser() {
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" > /etc/apt/sources.list.d/microsoft-edge.list
+    apt update; apt install -y microsoft-edge-stable
+}
+
+install_novnc_and_openresty() {
+    echo "--- 配置 HTTPS 和 NoVNC ---"
+    apt install -y haveged gnupg2 ca-certificates lsb-release
+
+    mkdir -p /usr/share/keyrings
+    wget -qO - https://openresty.org/package/pubkey.gpg | gpg --dearmor --yes -o /usr/share/keyrings/openresty.gpg
+    echo "deb [signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/debian $(lsb_release -sc) openresty" | tee /etc/apt/sources.list.d/openresty.list
+    apt update; apt install -y openresty novnc websockify
+
+    mkdir -p ${SSL_CERT_DIR}
+    if [ ! -f "${SSL_CRT}" ]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout ${SSL_KEY} -out ${SSL_CRT} -subj "/C=CN/ST=Shanghai/O=VNC/CN=vnc-web"
+        chmod 644 ${SSL_CRT}; chmod 600 ${SSL_KEY}
+    fi
+
+    mkdir -p /usr/local/openresty/nginx/logs/ /var/log/nginx/ /etc/openresty/conf.d
+    chown -R www-data:www-data /usr/local/openresty/nginx/logs/ /var/log/nginx/
+
+    NGINX_WS=""
+    for ((i=1; i<=3; i++)); do
+        NGINX_WS+="location /websockify/${i} { proxy_pass http://127.0.0.1:$((6080+i))/; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \"Upgrade\"; proxy_set_header Host \$host; proxy_buffering off; proxy_read_timeout 86400s; proxy_send_timeout 86400s; }"
+    done
+
+    patch_novnc_utf8_clipboard
+
+    cat > /etc/openresty/nginx.conf <<EOF
+user www-data; worker_processes auto;
+events { worker_connections 1024; }
+http {
+    include mime.types; default_type application/octet-stream;
+    server {
+        listen 443 ssl; server_name _;
+        ssl_certificate ${SSL_CRT}; ssl_certificate_key ${SSL_KEY};
+        rewrite ^/vnc([0-9]+)/?\$ /vnc.html?path=websockify/\$1&autoconnect=true&reconnect=true redirect;
+        rewrite ^/view/?\$ /vnc.html?path=websockify/3&view_only=true&autoconnect=true redirect;
+        location / { root $NOVNC_WEB_ROOT; index vnc.html; try_files \$uri \$uri/ =404; add_header Cache-Control "no-cache"; }
+        $NGINX_WS
+    }
+
+    include conf.d/*.conf;
+}
+EOF
+    systemctl enable openresty
+    systemctl restart openresty
+    echo "✅ HTTPS 与 Nginx 配置完成。"
+}
+
+patch_novnc_utf8_clipboard() {
+    echo "--- 配置 noVNC 中文剪贴板双向无乱码补丁 ---"
+    local rfb_js="${NOVNC_WEB_ROOT}/core/rfb.js"
+    local ui_js="${NOVNC_WEB_ROOT}/app/ui.js"
+
+    if [ -f "$rfb_js" ]; then
+        # 1. 出站 (Web -> Linux): 使用 TextEncoder 产生纯净 UTF-8 字节流
+        python3 -c "
+with open('$rfb_js', 'r') as f: content = f.read()
+target = '''            let data = new Uint8Array(text.length);
+            for (let i = 0; i < text.length; i++) {
+                // FIXME: text can have values outside of Latin1/Uint8
+                data[i] = text.charCodeAt(i);
+            }
+
+            RFB.messages.clientCutText(this._sock, data);'''
+repl = '''            const data = new TextEncoder().encode(text);
+            RFB.messages.clientCutText(this._sock, data);'''
+if target in content:
+    with open('$rfb_js', 'w') as f: f.write(content.replace(target, repl))
+" 2>/dev/null || true
+
+        # 2. 进站 (Linux -> Web): 使用 TextDecoder 进行 UTF-8 解码，杜绝 Latin-1 乱码
+        python3 -c "
+with open('$rfb_js', 'r') as f: content = f.read()
+target = 'const text = this._sock.rQshiftStr(length);'
+repl = '''const bytes = new Uint8Array(this._sock.rQshiftBytes(length));
+            let text;
+            try { text = new TextDecoder(\"utf-8\").decode(bytes); }
+            catch(e) { text = String.fromCharCode.apply(null, bytes); }'''
+if target in content:
+    with open('$rfb_js', 'w') as f: f.write(content.replace(target, repl))
+" 2>/dev/null || true
+    fi
+
+    if [ -f "$ui_js" ]; then
+        # 3. 增强实时同步：添加 input 事件监听，粘贴或输入即刻同步
+        if ! grep -q "addEventListener('input', UI.clipboardSend)" "$ui_js" 2>/dev/null; then
+            sed -i '/addEventListener('"'"'change'"'"', UI.clipboardSend);/a \        document.getElementById("noVNC_clipboard_text").addEventListener("input", UI.clipboardSend);' "$ui_js" 2>/dev/null || true
+        fi
+
+        # 4. 优化自动重连：无论正常或异常中断均触发自动重连，解决长时间不用黑屏假死
+        python3 -c "
+with open('$ui_js', 'r') as f: content = f.read()
+target = '''        if (!e.detail.clean) {
+            UI.updateVisualState('disconnected');
+            if (wasConnected) {
+                UI.showStatus(_(\"Something went wrong, connection is closed\"),
+                              'error');
+            } else {
+                UI.showStatus(_(\"Failed to connect to server\"), 'error');
+            }
+        } else if (UI.getSetting('reconnect', false) === true && !UI.inhibitReconnect) {
+            UI.updateVisualState('reconnecting');
+
+            const delay = parseInt(UI.getSetting('reconnect_delay'));
+            UI.reconnectCallback = setTimeout(UI.reconnect, delay);
+            return;'''
+repl = '''        if (UI.getSetting('reconnect', false) === true && !UI.inhibitReconnect) {
+            UI.updateVisualState('reconnecting');
+
+            const delay = parseInt(UI.getSetting('reconnect_delay'));
+            UI.reconnectCallback = setTimeout(UI.reconnect, delay);
+            return;
+        } else if (!e.detail.clean) {
+            UI.updateVisualState('disconnected');
+            if (wasConnected) {
+                UI.showStatus(_(\"Something went wrong, connection is closed\"),
+                              'error');
+            } else {
+                UI.showStatus(_(\"Failed to connect to server\"), 'error');
+            }'''
+if target in content:
+    with open('$ui_js', 'w') as f: f.write(content.replace(target, repl))
+" 2>/dev/null || true
+    fi
+
+    # 彻底禁用 light-locker 屏幕锁与息屏，防止长时间放置后黑屏
+    if [ -f /etc/xdg/autostart/light-locker.desktop ]; then
+        sed -i '/^Hidden=/d' /etc/xdg/autostart/light-locker.desktop
+        echo "Hidden=true" >> /etc/xdg/autostart/light-locker.desktop
+    fi
+    if command -v light-locker >/dev/null 2>&1 && [ ! -f /usr/bin/light-locker.real ]; then
+        dpkg-divert --add --rename --divert /usr/bin/light-locker.real /usr/bin/light-locker 2>/dev/null || true
+        cat << 'EOF_LOCK' > /usr/bin/light-locker
+#!/bin/sh
+exit 0
+EOF_LOCK
+        chmod +x /usr/bin/light-locker
+    fi
+
+    echo "✅ noVNC 中文剪贴板双向补丁与防黑屏长效保持已就绪。"
+}
+
+# =======================================================
+# 核心亮点：Systemd 级联服务流水线模板生成
+# =======================================================
+install_systemd_pipeline_units() {
+    echo "--- 正在安装 Systemd 级联微服务架构 ---"
+
+    mkdir -p ${VNC_CONF_DIR}
+
+    # 1. 初始化分辨率独立配置文件 (默认 1920x1080)
+    if [ ! -f "${VNC_CONF_DIR}/display-1.conf" ]; then
+        cat > "${VNC_CONF_DIR}/display-1.conf" << 'EOF'
+WIDTH=1920
+HEIGHT=1080
+DEPTH=24
+# EXTRA_XVFB_ARGS=""
+EOF
+        chown -R ${VNC_USER}:${VNC_USER} ${VNC_CONF_DIR}
+    fi
+
+    # 确保 LXDE 会话配置及剪贴板/输入法自启动
+    local lx_dir="${USER_HOME}/.config/lxsession/LXDE"
+    mkdir -p "${lx_dir}"
+    if [ ! -f "${lx_dir}/desktop.conf" ] && [ -f /etc/xdg/lxsession/LXDE/desktop.conf ]; then
+        cp /etc/xdg/lxsession/LXDE/desktop.conf "${lx_dir}/desktop.conf"
+    fi
+    if [ ! -f "${lx_dir}/autostart" ]; then
+        cat > "${lx_dir}/autostart" << 'EOF_AUTO'
+@lxpanel --profile LXDE
+@pcmanfm --desktop --profile LXDE
+@autocutsel -s CLIPBOARD -fork
+@autocutsel -s PRIMARY -fork
+@fcitx
+@xset s off -dpms s noblank
+EOF_AUTO
+    else
+        grep -q "autocutsel -s CLIPBOARD" "${lx_dir}/autostart" || echo "@autocutsel -s CLIPBOARD -fork" >> "${lx_dir}/autostart"
+        grep -q "autocutsel -s PRIMARY" "${lx_dir}/autostart" || echo "@autocutsel -s PRIMARY -fork" >> "${lx_dir}/autostart"
+        grep -q "fcitx" "${lx_dir}/autostart" || echo "@fcitx" >> "${lx_dir}/autostart"
+        grep -q "xset s off" "${lx_dir}/autostart" || echo "@xset s off -dpms s noblank" >> "${lx_dir}/autostart"
+    fi
+    chown -R ${VNC_USER}:${VNC_USER} "${USER_HOME}/.config"
+
+    # 2. Xvfb 基础帧缓冲显存服务单元 (特定普通用户执行 + 独立日志)
+    cat > /etc/systemd/system/xvfb@.service << EOF
+[Unit]
+Description=X Virtual Framebuffer Display Server on Display :%i
+After=network.target
+
+[Service]
+Type=simple
+User=${VNC_USER}
+Group=${VNC_USER}
+EnvironmentFile=-${USER_HOME}/.vnc/display-%i.conf
+Environment=WIDTH=1920
+Environment=HEIGHT=1080
+Environment=DEPTH=24
+ExecStartPre=-/bin/rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i
+ExecStart=/usr/bin/Xvfb :%i -screen 0 \${WIDTH}x\${HEIGHT}x\${DEPTH} \$EXTRA_XVFB_ARGS
+ExecStopPost=-/usr/local/bin/vnc-alert post-stop %n %i \$SERVICE_RESULT \$EXIT_CODE \$EXIT_STATUS
+TimeoutStopSec=3
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 3. LXDE 桌面环境服务单元 (强绑定 BindsTo=xvfb)
+    cat > /etc/systemd/system/vnc-desktop@.service << EOF
+[Unit]
+Description=LXDE Desktop Session on Display :%i
+After=xvfb@%i.service network.target
+Requires=xvfb@%i.service
+BindsTo=xvfb@%i.service
+
+[Service]
+Type=simple
+User=${VNC_USER}
+Group=${VNC_USER}
+WorkingDirectory=${USER_HOME}
+Environment=DISPLAY=:%i
+Environment=GTK_IM_MODULE=fcitx
+Environment=QT_IM_MODULE=fcitx
+Environment=XMODIFIERS=@im=fcitx
+Environment=LC_ALL=zh_CN.UTF-8
+
+# 等待 X11 Socket 出现就绪
+ExecStartPre=/bin/sh -c 'TIMEOUT=50; while [ ! -S /tmp/.X11-unix/X%i ]; do sleep 0.2; TIMEOUT=\$((TIMEOUT-1)); if [ \$TIMEOUT -le 0 ]; then exit 1; fi; done'
+# 禁用休眠、防黑屏
+ExecStartPre=-/usr/bin/xset s off -dpms s noblank
+ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startlxde
+TimeoutStopSec=3
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 4. x11vnc RFB 传输网络服务 (强绑定 BindsTo=xvfb)
+    cat > /etc/systemd/system/x11vnc@.service << EOF
+[Unit]
+Description=x11vnc Server on Display :%i
+After=xvfb@%i.service vnc-desktop@%i.service
+Requires=xvfb@%i.service
+BindsTo=xvfb@%i.service
+
+[Service]
+Type=simple
+User=${VNC_USER}
+Group=${VNC_USER}
+Environment=DISPLAY=:%i
+ExecStartPre=/bin/sh -c 'TIMEOUT=50; while [ ! -S /tmp/.X11-unix/X%i ]; do sleep 0.2; TIMEOUT=\$((TIMEOUT-1)); if [ \$TIMEOUT -le 0 ]; then exit 1; fi; done'
+ExecStart=/usr/bin/x11vnc -display :%i -rfbport 590%i -forever -shared -rfbauth ${VNC_PASSWD_FILE}
+ExecStartPost=-/usr/local/bin/vnc-alert post-start %n %i
+ExecStopPost=-/usr/local/bin/vnc-alert post-stop %n %i \$SERVICE_RESULT \$EXIT_CODE \$EXIT_STATUS
+SuccessExitStatus=2 15
+TimeoutStopSec=3
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 5. Websockify 网关服务
+    cat > /etc/systemd/system/websockify@.service << EOF
+[Unit]
+Description=Websockify for Display :%i
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/websockify --heartbeat 30 127.0.0.1:608%i 127.0.0.1:590%i
+TimeoutStopSec=3
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 6. 总调度 Target (一键启停全部级联节点)
+    cat > /etc/systemd/system/vnc-stack@.target << EOF
+[Unit]
+Description=VNC Full Stack Pipeline for Display :%i
+Wants=xvfb@%i.service vnc-desktop@%i.service x11vnc@%i.service websockify@%i.service mt5-watchdog@%i.service
+After=xvfb@%i.service vnc-desktop@%i.service x11vnc@%i.service websockify@%i.service mt5-watchdog@%i.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 7. MT5 智能守护 (强绑定桌面)
+    cat > /etc/systemd/system/mt5-watchdog@.service << EOF
+[Unit]
+Description=MetaTrader 5 Auto-Recovery Watchdog on Display :%i
+After=vnc-desktop@%i.service
+Requires=vnc-desktop@%i.service
+BindsTo=vnc-desktop@%i.service
+
+[Service]
+Type=simple
+User=${VNC_USER}
+Group=${VNC_USER}
+Environment=DISPLAY=:%i
+Environment=WINEPREFIX=${USER_HOME}/.wine
+Environment=WINEDEBUG=-all
+ExecStart=/bin/bash ${USER_HOME}/mt5_watchdog.sh
+ExecStop=-/usr/bin/wineserver -k
+ExecStopPost=-/usr/local/bin/vnc-alert mt5-service-stop %n %i \$SERVICE_RESULT \$EXIT_CODE \$EXIT_STATUS
+TimeoutStopSec=3
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    echo "✅ Systemd 级联服务单元部署就绪！"
+}
+
+setup_mt5_watchdog_script() {
+    local watchdog_script="${USER_HOME}/mt5_watchdog.sh"
+
+    cat > "${watchdog_script}" << 'EOF_WATCHDOG'
+#!/bin/bash
+export WINEPREFIX="${HOME}/.wine"
+export WINEDEBUG=-all
+export DISPLAY="${DISPLAY:-:1}"
+DISP_NUM="${DISPLAY#:}"
+
+find_mt5() {
+    find "$WINEPREFIX/drive_c/Program Files" -maxdepth 3 -name "terminal64.exe" 2>/dev/null | head -n 1
+}
+
+get_pid() {
+    pgrep -u "$(whoami)" -f "terminal64.exe" | head -n 1
+}
+
+LAST_PID=""
+LAST_STATE="INIT"
+LAST_LAUNCH_TIME=0
+
+# 初始获取运行状态
+CURRENT_PID=$(get_pid)
+if [ -n "$CURRENT_PID" ]; then
+    LAST_PID="$CURRENT_PID"
+    LAST_STATE="RUNNING"
+else
+    LAST_STATE="STOPPED"
+fi
+
+while true; do
+    CURRENT_PID=$(get_pid)
+
+    if [ "$LAST_STATE" = "RUNNING" ]; then
+        if [ -z "$CURRENT_PID" ]; then
+            # 状态改变：MT5 关闭/退出/崩溃
+            LAST_STATE="STOPPED"
+            /usr/local/bin/vnc-alert mt5-exit "$DISP_NUM" "0" "用户手动关闭或意外终止" >/dev/null 2>&1 || true
+            LAST_PID=""
+        elif [ "$CURRENT_PID" != "$LAST_PID" ]; then
+            # PID 发生变更
+            /usr/local/bin/vnc-alert mt5-exit "$DISP_NUM" "0" "进程已终止更换" >/dev/null 2>&1 || true
+            /usr/local/bin/vnc-alert mt5-restart "$DISP_NUM" "$CURRENT_PID" >/dev/null 2>&1 || true
+            LAST_PID="$CURRENT_PID"
+        fi
+    elif [ "$LAST_STATE" = "STOPPED" ]; then
+        if [ -n "$CURRENT_PID" ]; then
+            # 状态改变：MT5 成功拉起就绪
+            LAST_STATE="RUNNING"
+            LAST_PID="$CURRENT_PID"
+            /usr/local/bin/vnc-alert mt5-restart "$DISP_NUM" "$CURRENT_PID" >/dev/null 2>&1 || true
+        else
+            # MT5 处于未运行状态，执行自愈启动（带 10 秒防重复启动保护）
+            NOW=$(date +%s)
+            if [ $((NOW - LAST_LAUNCH_TIME)) -ge 10 ]; then
+                LAST_LAUNCH_TIME=$NOW
+                MT5_EXE=$(find_mt5)
+                if [ -n "$MT5_EXE" ] && [ -f "$MT5_EXE" ]; then
+                    wine-stable "$MT5_EXE" >/dev/null 2>&1 &
+                fi
+            fi
+        fi
+    fi
+
+    sleep 2
+done
+EOF_WATCHDOG
+
+    chmod +x "${watchdog_script}"
+    chown ${VNC_USER}:${VNC_USER} "${watchdog_script}"
+}
+
+create_pipeline_res_tool() {
+    local tool_path="${DESKTOP_DIR}/切换分辨率(Systemd版).sh"
+
+    cat > "${tool_path}" << 'EOF_TOOL'
+#!/bin/bash
+if [ "$EUID" -ne 0 ]; then
+    echo "正在请求管理员权限..."
+    sudo bash "$0"
+    exit
+fi
+
+CONF="/home/CURRENT_VNC_USER_PLACEHOLDER/.vnc/display-1.conf"
+
+echo "=== Systemd 级联服务架构 - 分辨率切换工具 ==="
+echo " [1] 1920 x 1080 (1080P 标准全高清)"
+echo " [2] 1280 x 720  (720P 极简省流)"
+echo " [3] 2560 x 1440 (2K 横屏)"
+echo " [4] 1080 x 1920 (手机竖屏)"
+echo " [5] 1440 x 2560 (2K 竖屏)"
+echo " [6] 2560 x 2880 (超大方屏 / MT5 多图表神器)"
+echo " [7] 2550 x 2715 (定制专属大方屏)"
+read -p "请选择分辨率 [1-7]: " res_c
+
+case $res_c in
+    2) W=1280; H=720 ;;
+    3) W=2560; H=1440 ;;
+    4) W=1080; H=1920 ;;
+    5) W=1440; H=2560 ;;
+    6) W=2560; H=2880 ;;
+    7) W=2550; H=2715 ;;
+    *) W=1920; H=1080 ;;
+esac
+
+cat > "$CONF" << EOF
+WIDTH=$W
+HEIGHT=$H
+DEPTH=24
+# EXTRA_XVFB_ARGS=""
+EOF
+
+echo "⚙️ 分辨率已保存为 ${W}x${H}。"
+echo "🔄 正在下发重启指令..."
+systemctl restart --no-block xvfb@1
+
+echo "✅ 重启任务已成功提交！桌面流水线将在后台重新加载（${W}x${H}），请在 3-5 秒后刷新网页连接。"
+sleep 1
+EOF_TOOL
+
+    sed -i "s/CURRENT_VNC_USER_PLACEHOLDER/${VNC_USER}/g" "${tool_path}"
+    chmod +x "${tool_path}"
+    chown ${VNC_USER}:${VNC_USER} "${tool_path}"
+}
+
+create_edge_tool() {
+    echo "--- 生成 Edge 控制工具 ---"
+    apt update && apt install -y wmctrl xdotool
+    local tool_path="${DESKTOP_DIR}/重置Edge窗口.sh"
+
+    cat > "${tool_path}" << 'EOF'
+#!/bin/bash
+if [ "$EUID" -eq 0 ]; then su - CURRENT_VNC_USER_PLACEHOLDER -c "bash $0"; exit; fi
+export DISPLAY=:1
+if ! pgrep -f "msedge" > /dev/null; then
+    microsoft-edge --disable-gpu --no-first-run --no-default-browser-check &
+    sleep 3
+fi
+SCREEN_W=$(xdotool getdisplaygeometry | awk '{print $1}')
+SCREEN_H=$(xdotool getdisplaygeometry | awk '{print $2}')
+echo "1. 手机模式 (500x900)"
+echo "2. 影院模式 (1920x1080)"
+echo "3. 网页全览"
+read -p "选择: " l
+case $l in
+    1) W=500; H=900; X=$(( (SCREEN_W - W) / 2 )); Y=100 ;;
+    2) W=1920; H=1080; X=$(( (SCREEN_W - W) / 2 )); Y=$(( (SCREEN_H - H) / 2 )) ;;
+    *) W=$(( SCREEN_W - 40 )); H=$(( SCREEN_H - 100 )); X=20; Y=40 ;;
+esac
+wmctrl -r "Microsoft Edge" -b remove,maximized_vert,maximized_horz
+wmctrl -r "Microsoft Edge" -e 0,$X,$Y,$W,$H
+wmctrl -a "Microsoft Edge"
+EOF
+
+    sed -i "s/CURRENT_VNC_USER_PLACEHOLDER/${VNC_USER}/g" "${tool_path}"
+    chmod +x "${tool_path}"
+    chown ${VNC_USER}:${VNC_USER} "${tool_path}"
+    echo "✅ Edge 控制工具已生成至桌面: ${tool_path}"
+}
+
+install_gost_ipv6() {
+    echo "--- 正在安装 Gost 隧道代理 (Systemd 微服务版) ---"
+    local gost_dir="/opt/gost"
+    mkdir -p "${gost_dir}"
+
+    if [ ! -f "${gost_dir}/gost" ]; then
+        echo "⬇️ 正在下载 Gost 核心二进制..."
+        cd /tmp
+        wget -q --show-progress "https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_amd64.tar.gz" -O gost.tar.gz || {
+            echo "❌ Gost 下载失败，请检查网络连接。"
+            return 1
+        }
+        tar -xzf gost.tar.gz
+        mv gost "${gost_dir}/gost"
+        chmod +x "${gost_dir}/gost"
+        rm -f gost.tar.gz
+    fi
+
+    echo "⚙️ 配置 Gost 连接参数："
+    read -p "用户名 [回车默认: user]: " U; U=${U:-user}
+    read -p "密码 [回车默认: pass]: " P; P=${P:-pass}
+    read -p "端口 [回车默认: 443]: " PO; PO=${PO:-443}
+
+    # 平稳接管：若曾有 supervisor 配置则关闭以避免端口冲突
+    if [ -f /etc/supervisor/conf.d/gost.conf ]; then
+        echo "ℹ️ 检测到旧版 Supervisor 中的 gost 配置，正在平滑迁移至 Systemd..."
+        supervisorctl stop gost 2>/dev/null || true
+        mv /etc/supervisor/conf.d/gost.conf /etc/supervisor/conf.d/gost.conf.bak 2>/dev/null || true
+        supervisorctl update 2>/dev/null || true
+    fi
+
+    # 创建标准 Systemd 服务单元
+    cat > /etc/systemd/system/gost.service <<EOF
+[Unit]
+Description=GOST Tunnel Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${gost_dir}/gost -L "mwss://${U}:${P}@[:]:${PO}"
+WorkingDirectory=${gost_dir}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable gost
+    systemctl restart gost
+    echo "=========================================================="
+    echo "✅ Gost 隧道服务已成功以 Systemd 微服务形式启动！"
+    echo "   协议链接: mwss://${U}:${P}@[:]:${PO}"
+    echo "   状态查看: systemctl status gost"
+    echo "=========================================================="
+}
+
+
+activate_pipeline_services() {
+    echo "--- 配置 VNC 密码与启动级联服务 ---"
+
+    if [ ! -f "${VNC_PASSWD_FILE}" ]; then
+        su - ${VNC_USER} -c "mkdir -p ~/.vnc; x11vnc -storepasswd ${VNC_PASSWD_FILE}"
+        chmod 600 ${VNC_PASSWD_FILE}
+    fi
+
+    setup_mt5_watchdog_script
+    create_pipeline_res_tool
+
+    # 平稳过渡：停止并禁用旧版单体服务 (防止显示号 :1 与 5901 冲突)
+    if systemctl is-active vnc-server >/dev/null 2>&1 || systemctl is-enabled vnc-server >/dev/null 2>&1; then
+        echo "🛑 正在平稳过渡：停止并注销旧版 vnc-server 服务..."
+        systemctl stop vnc-server 2>/dev/null || true
+        systemctl disable vnc-server 2>/dev/null || true
+        pkill -u ${VNC_USER} -f "start_vnc_boot.sh" 2>/dev/null || true
+    fi
+
+    # 启用全部级联服务单元
+    systemctl enable xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 vnc-stack@1.target mt5-watchdog@1 2>/dev/null || true
+    systemctl restart vnc-stack@1.target
+
+    echo "=========================================================="
+    echo "✅ Systemd 级联服务流水线已激活并开机自启！"
+    echo "   - xvfb@1.service         (虚拟显存)"
+    echo "   - vnc-desktop@1.service  (LXDE 桌面环境)"
+    echo "   - x11vnc@1.service       (VNC 传输协议)"
+    echo "   - websockify@1.service   (WebSocket 网页桥接)"
+    echo "   - mt5-watchdog@1.service (MT5 7*24 自动自愈)"
+    echo "=========================================================="
+}
+
+main_menu() {
+    while true; do
+        clear
+        echo "=== Debian 12 VNC (Systemd 级联服务微服务版) ==="
+        echo "当前运行用户: ${VNC_USER} (已隔离)"
+        echo "--------------------------------------------------"
+        echo " [1] 初始化系统环境 (中文语言/用户隔离/LXC检查)"
+        echo " [2] 安装 LXDE 桌面核心"
+        echo " [3] 安装 Wine 环境"
+        echo " [4] 安装 Edge 浏览器"
+        echo " [5] 安装 HTTPS (OpenResty+NoVNC)"
+        echo " [6] 安装并激活 Systemd 级联服务流水线 (推荐)"
+        echo " [7] 生成 Edge 控制工具 (桌面快捷)"
+        echo " [8] 安装 Gost 隧道代理 (Systemd 微服务版)"
+        echo " [9] 查看各微服务运行状态 (systemctl)"
+        echo " [99] 停止所有服务 (VNC级联与Gost)"
+        echo " [0] 退出"
+        read -p "选项: " c
+        case $c in
+            1) setup_system_and_user_and_locale ;;
+            2) install_lxde_desktop ;;
+            3) install_wine_env ;;
+            4) install_edge_browser ;;
+            5) install_novnc_and_openresty ;;
+            6) 
+                install_systemd_pipeline_units
+                activate_pipeline_services
+                ;;
+            7) create_edge_tool ;;
+            8) install_gost_ipv6 ;;
+            9) 
+                systemctl status xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 gost --no-pager
+                ;;
+            99) 
+                systemctl stop vnc-stack@1.target xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 mt5-watchdog@1 gost 2>/dev/null || true
+                echo "已停止所有服务。"
+                ;;
+            0) exit 0 ;;
+        esac
+        read -p "按回车继续..."
+    done
+}
+
+check_root
+configure_username
+main_menu
+

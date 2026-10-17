@@ -55,3 +55,20 @@ sudo bash scripts/hysteria2_setup.sh --uninstall  # 卸载
 # 可选：--port 443 --domain bing.com --mask-url https://bing.com/ --no-qr（不显示二维码） \
 #       --new-password（强制换随机密码） --keep-password（沿用旧密码）
 ```
+
+### VNC 桌面环境（`f. VNC 桌面环境`）
+
+`scripts/vnc_desktop_setup.sh` 一键搭建 Debian 12 的 VNC 远程桌面（Systemd 级联服务版）：
+Xvfb + LXDE + x11vnc + websockify/noVNC + OpenResty(HTTPS)，可选 Wine / Edge / MT5
+自愈守护 / Gost 隧道。各组件由独立 systemd 单元托管（`BindsTo` 强绑定、崩溃自动重启）。
+
+```bash
+# 可以在 LXC 容器内运行（推荐），也可以在物理机/独立 VPS 上运行
+sudo bash scripts/vnc_desktop_setup.sh
+```
+
+**容器适配**：Linux 的 swap 不参与命名空间隔离，容器内 `swapon` 会直接改写**宿主内核**的
+swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本会先检测容器环境
+（`systemd-detect-virt` / `/run/systemd/container` / `/proc/1/environ` 的 `container=` 等），
+命中即**跳过 swapfile 的创建与启用**，交由宿主机统一管理；非容器环境才会创建 swap。
+另外脚本会检查 `/proc/swaps`，绝不覆盖正在使用的 swap 文件。
