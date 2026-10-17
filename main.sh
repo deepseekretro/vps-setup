@@ -8,14 +8,16 @@ set -euo pipefail
 
 
 # GitHub 配置
-GITHUB_USER="wyrover"
+GITHUB_USER="deepseekretro"
 GITHUB_REPO="vps-setup"
 GITHUB_BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
+# 导出给子脚本使用（子脚本以 bash <(curl ...) 方式运行，会继承该变量）
+export BASE_URL
 
 # 版本信息
-VERSION="1.4.0"
-LAST_UPDATE="2026-01-22"
+VERSION="1.5.0"
+LAST_UPDATE="2026-10-17"
 
 
 # 颜色定义
@@ -584,6 +586,7 @@ show_help() {
     echo ""
     
     echo -e "${CYAN}功能模块:${NC}"
+    echo "  d. 宿主机配置 - ZRAM 压缩交换（LXC/物理宿主专用）"
     echo "  1. 安全配置  - SSH密钥、防火墙、Fail2ban"
     echo "  2. 系统配置  - 主机名、时区、软件包管理"
     echo "  3. 监控查看  - 系统状态、日志查看"
@@ -624,6 +627,11 @@ show_main_menu() {
     echo "=========================================="
     echo "   Debian 12 系统配置工具 v${VERSION}"
     echo "=========================================="
+    echo ""
+    echo "【宿主机配置】"
+    echo ""
+    echo "d. 🧠 宿主机 ZRAM 压缩交换"
+    echo "   (LXC/物理宿主专用：自动调参、部署、状态、回滚)"
     echo ""
     echo "【系统管理】"
     echo ""
@@ -681,9 +689,12 @@ show_main_menu() {
 main_menu() {
     while true; do
         show_main_menu
-        read -p "请选择 [0-9/a-c/i/t/u/h]: " choice
+        read -p "请选择 [0-9/a-d/i/t/u/h]: " choice
         
         case $choice in
+            d|D)
+                run_subscript "zram_setup"
+                ;;
             1)
                 run_subscript "security_monitoring"
                 ;;
