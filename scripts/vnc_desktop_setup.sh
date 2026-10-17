@@ -273,8 +273,10 @@ setup_system_and_user_and_locale() {
     apt update
     # 全部 --no-install-recommends：避免拉进 zenity/libwebkit2gtk/ghostscript/
     # imagemagick/gstreamer/mesa-vulkan 等数百 MiB 的推荐包（实测可省 300~500 MiB）
+    # 注：xauth / x11-utils / fontconfig 虽被上游列为 Recommends，但本方案实际要用，
+    #     故显式列出（合计仅约 1.4 MiB）。
     apt install -y --no-install-recommends curl wget sudo gnupg2 sed locales xdg-user-dirs openssl haveged \
-        xvfb x11vnc apt-transport-https ca-certificates procps \
+        xvfb x11vnc xauth x11-utils fontconfig apt-transport-https ca-certificates procps \
         wmctrl xdotool autocutsel lsb-release x11-xserver-utils
     mkdir -p /etc/pipewire && touch /etc/pipewire/client.conf
 

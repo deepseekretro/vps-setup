@@ -92,3 +92,8 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
 **精简安装**：所有 apt 安装均带 `--no-install-recommends`（避免推荐包带进
 zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等数百 MiB），
 中文字体只装体积更小的 `fonts-wqy-microhei`；Wine / Edge / Gost 保持独立菜单可选项，按需安装。
+另有少数被上游列为 Recommends 但本方案实际需要的 `xauth` / `x11-utils` / `fontconfig`
+已显式列进依赖清单（合计约 1.4 MiB），不会因关闭推荐而缺件。
+（本次改造前，`zenity` 作为 `im-config` / `fcitx-ui-classic` 的推荐包被装入，连带
+`libwebkit2gtk`(90 MiB) / `libjavascriptcoregtk`(31 MiB) / `libflite1`(27 MiB) /
+gstreamer 插件链 —— 同一批依赖在旧安装里实测约 300 MiB。）
