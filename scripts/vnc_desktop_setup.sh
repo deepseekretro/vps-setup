@@ -138,6 +138,9 @@ create_desktop_user() {
 #   - 注销/锁屏程序：dpkg-divert 备份后替换为空操作（点击无任何反应）
 #   - 隐藏 lxde-logout / lxde-screenlock 桌面条目（用户级 Hidden=true，升级不复活）
 #   - 屏保/息屏：light-locker / xscreensaver / DPMS 全部关闭
+#   - polkit 认证代理（lxpolkit）关闭：本桌面是 systemd 系统服务、没有 logind 会话，
+#     lxpolkit 必然注册失败并把 "No session for pid <PID>" 弹成「错误」对话框
+#     （每次切分辨率/重启桌面都弹一次）。这里不需要 polkit 授权，直接关掉。
 # 幂等：重复执行只做校验与补齐。
 # =======================================================
 silence_desktop_bins() {
@@ -250,6 +253,46 @@ EOF_AWK
     touch "${lx_dir}/autostart"
     grep -q "xset s off" "${lx_dir}/autostart" || echo "@xset s off -dpms s noblank" >> "${lx_dir}/autostart"
     chown -R ${VNC_USER}:${VNC_USER} "${lx_dir}" 2>/dev/null || true
+
+    # ---- 3) 关闭 lxpolkit（polkit 认证代理），消除「No session for pid N」弹框 ----
+    #
+    # 现象：每次切分辨率（= 重启 xvfb@N，BindsTo 连带重启整个桌面）后，桌面上都会弹出一个
+    #       标题为「错误」的对话框，正文是 "No session for pid <PID>"。
+    # 原因：本桌面跑在 systemd 系统服务 vnc-desktop@N.service 里，不是 logind 登录会话
+    #       （loginctl list-sessions 为空）。lxpolkit 启动时会执行
+    #           polkit_unix_session_new_for_process_sync(getpid(), ...)
+    #       查「自己属于哪个会话」，必然失败；lxpolkit 的源码随即把这个 GError 的文本
+    #       直接 show_msg() 成 GTK 错误框（lxsession/lxpolkit/lxpolkit.c）。
+    #       PID 就是那一次 lxpolkit 自己的 pid，所以每次重启数字都不一样。
+    # 处理：这个桌面里没有任何需要 polkit 授权的东西（注销/关机入口已在本模块屏蔽），
+    #       所以直接把代理关掉：既不再弹框，也保持「不做管理员授权就拿不到特权」的严格姿态。
+    #       注意：不要改成给服务加 PAMName=login 去「真修」——那会让桌面被 polkit 当成
+    #       本地活动会话，logind 的关机/重启等 allow_active 动作会变成免密执行。
+    local lx_conf="${lx_dir}/desktop.conf"
+    if [ ! -f "${lx_conf}" ]; then
+        printf '[Session]\npolkit/command=\n' > "${lx_conf}"
+    elif grep -q '^polkit/command=' "${lx_conf}"; then
+        sed -i 's|^polkit/command=.*|polkit/command=|' "${lx_conf}"
+    elif grep -q '^\[Session\]' "${lx_conf}"; then
+        awk 'BEGIN{done=0} {print} /^\[Session\]$/ && !done {print "polkit/command="; done=1}' \
+            "${lx_conf}" > "${lx_conf}.new" && mv "${lx_conf}.new" "${lx_conf}"
+    else
+        { printf '[Session]\npolkit/command=\n'; cat "${lx_conf}"; } > "${lx_conf}.new" \
+            && mv "${lx_conf}.new" "${lx_conf}"
+    fi
+    chown ${VNC_USER}:${VNC_USER} "${lx_conf}" 2>/dev/null || true
+    if grep -q '^polkit/command=lxpolkit' "${lx_conf}" 2>/dev/null; then
+        echo "⚠️ lxpolkit 关闭失败，请检查 ${lx_conf}"
+    else
+        echo "✅ 已关闭 lxpolkit 认证代理（不再弹「No session for pid N」错误框）"
+    fi
+
+    # 双保险：系统级自启条目也置 Hidden=true（Debian 默认已是，防止将来被改动）
+    if [ -f /etc/xdg/autostart/lxpolkit.desktop ] \
+       && ! grep -q '^Hidden=true' /etc/xdg/autostart/lxpolkit.desktop; then
+        sed -i '/^Hidden=/d' /etc/xdg/autostart/lxpolkit.desktop
+        echo "Hidden=true" >> /etc/xdg/autostart/lxpolkit.desktop
+    fi
 
     echo "✅ 桌面加固完成（注销/关机/屏幕锁入口均已失效）"
     echo "   如需恢复注销功能: dpkg-divert --remove /usr/bin/lxde-logout"

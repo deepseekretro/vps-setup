@@ -99,6 +99,13 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
 - `lxde-logout` / `lxsession-logout` / `lxlock` / `light-locker` / `xscreensaver`
   经 `dpkg-divert` 备份为同名 `.real` 后替换为空操作 → **点击毫无反应**
 - 用户级隐藏 `lxde-logout` / `lxde-screenlock` 桌面条目；`@xset s off -dpms s noblank` 防息屏
+- 关闭 polkit 认证代理 `lxpolkit`（用户级 `~/.config/lxsession/LXDE/desktop.conf` 里
+  `polkit/command=` 置空）。原因：本桌面跑在 systemd 系统服务 `vnc-desktop@N.service` 里、
+  不是 logind 登录会话，而 lxpolkit 启动时会查「自己属于哪个会话」，必然失败并把
+  `No session for pid <PID>` 这个错误**弹成一个标题为「错误」的对话框**（每次切分辨率 /
+  重启桌面都会弹一次，PID 每次都不同）。本桌面没有任何需要 polkit 授权的操作，
+  直接关掉最干净；也不建议改成给服务加 `PAMName=login` 去"真修"——那会让桌面被 polkit
+  视为本地活动会话，logind 的关机/重启等 `allow_active` 动作会变成**免密**执行。
 - 恢复注销功能：`dpkg-divert --remove /usr/bin/lxde-logout`（`.real` 是原程序），
   并删除用户级 panel 配置后重启 `vnc-desktop@1`
 
