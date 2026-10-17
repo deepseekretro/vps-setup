@@ -64,6 +64,15 @@
     border: 1px solid var(--border); border-radius: 7px;
   }
   #gridcols.show { display: block; }
+  /* 宫格-only helpers: fill/empty the wall (same look as the column picker) */
+  #gridacts { display: none; flex: 0 0 auto; gap: 6px; }
+  #gridacts.show { display: flex; }
+  #gridacts button {
+    font-size: 12px; padding: 4px 10px; cursor: pointer;
+    background: var(--panel); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 7px; white-space: nowrap;
+  }
+  #gridacts button:hover { color: var(--accent); border-color: var(--accent); }
 
   /* ---- left navigation: opencode sessions ---- */
   #shell { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -215,6 +224,9 @@
   #panes.grid-mode .pane-tools { padding-bottom: 4px; }
   /* no splitting in 宫格 / 分组: the layout itself decides where panes go */
   #panes.grid-mode .split-tool, #panes.group-mode .split-tool { display: none; }
+  /* 宫格: this cell comes off the wall (the terminal itself stays open) */
+  #panes.grid-mode .wall-tool { display: inline-block; }
+  .wall-tool { display: none; }
   .pane-term { flex: 1 1 auto; min-height: 0; position: relative; }
   .xterm { height: 100%; }
   .xterm .xterm-viewport { background: transparent !important; scrollbar-width: thin; }
@@ -242,6 +254,9 @@
   .tab { touch-action: pan-x; }
   .tab.dragging { opacity: .45; }
   .tab.offstage { opacity: .5; }
+  /* 宫格: the terminal has a cell on the wall (drag it onto the stage to rearrange) */
+  .tab.on-wall { border-color: rgba(25, 169, 123, .55); background: rgba(25, 169, 123, .10); }
+  .tab.on-wall .label::before { content: "▦"; color: var(--accent); margin-right: 4px; font-size: 11px; }
   .pane.droptgt::after {
     content: ""; position: absolute; z-index: 6; pointer-events: none;
     background: rgba(25, 169, 123, .22); border: 2px dashed var(--accent); border-radius: 8px;
@@ -250,6 +265,14 @@
   .pane.dz-right::after  { right: 2px; top: 2px;    bottom: 2px; width: 34%; }
   .pane.dz-top::after    { top: 2px;   left: 2px;   right: 2px;  height: 34%; }
   .pane.dz-bottom::after { bottom: 2px;left: 2px;   right: 2px;  height: 34%; }
+  /* 宫格: dropping on the middle of a cell replaces the terminal in it */
+  .pane.dz-center::after { inset: 2px; }
+  .pane.dz-center::before {
+    content: "换到这一格"; position: absolute; z-index: 7; pointer-events: none;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    padding: 3px 10px; border-radius: 7px; font-size: 12px; color: #08130f;
+    background: var(--accent); white-space: nowrap;
+  }
 
   /* ---- per-tab image upload (attaches the image to opencode) ---- */
   .pane-tools {
@@ -348,7 +371,7 @@
   <span id="status">连接中…</span>
   <div id="layoutsw" title="终端布局（Alt+L 循环切换）">
     <button type="button" data-mode="tabs" title="横排标签：标签超出宽度时自动收进「⋯ 其他终端」下拉">横排</button>
-    <button type="button" data-mode="grid" title="宫格平铺：所有终端自动网格排列，点哪格哪格聚焦（Alt+1..9 或标签栏切换）">宫格</button>
+    <button type="button" data-mode="grid" title="宫格平铺：手动拼墙 —— 把标签拖进画面才占一格（拖到格子中间=替换那格，✕ 移出=下墙），点标签也会上墙">宫格</button>
     <button type="button" data-mode="grouped" title="分组：按终端所在目录 / opencode 会话自动分组，左栏选组，标签栏只显示该组">分组</button>
   </div>
   <select id="gridcols" title="宫格列数">
@@ -358,8 +381,12 @@
     <option value="3">3 列</option>
     <option value="4">4 列</option>
   </select>
+  <span id="gridacts">
+    <button type="button" id="wallall" title="把当前所有终端都放进宫格（最多 9 格）">全部上墙</button>
+    <button type="button" id="wallone" title="宫格只留当前终端，其它下墙（终端不关）">只留当前</button>
+  </span>
   <div class="spacer"></div>
-  <div class="hint">+ 新建 · Alt+N/W · Alt+L 切布局 · Alt+1..9 切终端 · Ctrl+C 复制选区 · Ctrl+V 粘贴 · 右键「复制全部输出」 · TUI 内 Shift+拖选 · 🖼 上传图片：也可拖拽 / 粘贴 · ◫ 分屏：右键选方向 / 拖标签到面板边缘 / 拖中间分隔条调宽度</div>
+  <div class="hint">+ 新建 · Alt+N/W · Alt+L 切布局 · Alt+1..9 切终端 · Ctrl+C 复制选区 · Ctrl+V 粘贴 · 右键「复制全部输出」 · TUI 内 Shift+拖选 · 🖼 上传图片：也可拖拽 / 粘贴 · ◫ 分屏：右键选方向 / 拖标签到面板边缘 / 拖中间分隔条调宽度 · 宫格：拖标签进画面=上墙，拖格子中间=替换，✕ 移出=下墙</div>
 </header>
 
 <div id="shell">

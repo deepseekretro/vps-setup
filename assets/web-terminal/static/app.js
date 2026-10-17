@@ -16,6 +16,9 @@
   var tabMoreBtn = document.getElementById('tabmore');
   var layoutSwEl = document.getElementById('layoutsw');
   var gridColsEl = document.getElementById('gridcols');
+  var gridActsEl = document.getElementById('gridacts');
+  var wallAllBtn = document.getElementById('wallall');
+  var wallOneBtn = document.getElementById('wallone');
   var groupsEl = document.getElementById('groups');
   var gListEl = document.getElementById('g-list');
   var gCountEl = document.getElementById('g-count');
@@ -375,7 +378,7 @@
       ['全选', function () { selectAllSticky(t); }],
       ['清屏', function () { t.term.clear(); }],
       '-'
-    ].concat(splitMenuItems(id)));
+    ].concat(gridMenuItems(id)).concat(splitMenuItems(id)));
   }
 
   function attachAll() {
@@ -554,6 +557,17 @@
       openImagePicker(id);
     });
     tools.appendChild(upBtn);
+    var wallBtn = document.createElement('button');
+    wallBtn.type = 'button';
+    wallBtn.className = 'pane-tool wall-tool';      // only shown in 宫格
+    wallBtn.textContent = '✕ 移出';
+    wallBtn.title = '把这个终端从宫格里移出（终端本身不关闭，仍在标签栏里，拖回来即可重新上墙）';
+    wallBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
+    wallBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      wallRemove(id);
+    });
+    tools.appendChild(wallBtn);
 
     var host = document.createElement('div');
     host.className = 'pane-term';
@@ -702,6 +716,7 @@
   function activate(id) {
     var t = tabs.get(id);
     if (!t) return;
+    wallEnsure(id);                            // 宫格: whatever you focus must be visible
     if (layoutMode === 'tabs' && layoutTree && !treeHas(layoutTree, id)) {
       // split view: the tab is not on stage — show it in place of the focused
       // (or first) pane; the pane it replaces stays alive as a normal tab
@@ -748,6 +763,10 @@
     t.pane.remove();
     t.tabEl.remove();
     tabs.delete(id);
+    if (layoutMode === 'grid') {               // 宫格: a closed terminal leaves the wall
+      var wi = gridWall.indexOf(id);
+      if (wi >= 0) { gridWall.splice(wi, 1); saveWall(); }
+    }
     if (wasActive) activeId = null;
     saveTabs();
     renderLayout();                            // rebuild split boxes / pane visibility
@@ -873,7 +892,7 @@
     });
     tabs.forEach(function (t) {
       t.pane.classList.remove('in-split');
-      t.pane.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom');
+      t.pane.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom', 'dz-center');
       t.pane.style.flexGrow = '';
       t.pane.style.flexBasis = '';
       t.pane.style.flexShrink = '';
@@ -893,6 +912,13 @@
   // DOM order = tab order (unless a split tree already owns the panes).
   function orderPanes() {
     if (layoutMode === 'tabs' && layoutTree) return;
+    if (layoutMode === 'grid') {                       // wall order, not tab order
+      sanitizeWall().forEach(function (id) {
+        var t = tabs.get(id);
+        if (t) panes.appendChild(t.pane);
+      });
+      return;
+    }
     tabs.forEach(function (t) { panes.appendChild(t.pane); });
   }
 
@@ -900,8 +926,8 @@
   function visibleIds() {
     var on = Object.create(null);
     if (!tabs.size) return on;
-    if (layoutMode === 'grid') {                       // every terminal at once
-      tabs.forEach(function (t, id) { on[id] = true; });
+    if (layoutMode === 'grid') {                       // only what is on the wall
+      sanitizeWall().forEach(function (id) { if (tabs.has(id)) on[id] = true; });
       return on;
     }
     if (layoutMode === 'grouped') {                    // one terminal per group
@@ -1048,6 +1074,17 @@
     createTab();
   }
 
+  // 宫格: what the terminal's right-click menu offers for the wall.
+  function gridMenuItems(id) {
+    if (layoutMode !== 'grid') return [];
+    return [
+      wallHas(id) ? ['移出宫格（终端不关）', function () { wallRemove(id); }]
+                  : ['放进宫格', function () { wallEnsure(id); }],
+      ['全部上墙', function () { wallAll(); }],
+      ['只留当前一格', function () { wallOne(); }]
+    ];
+  }
+
   function splitMenuItems(id) {
     if (layoutMode !== 'tabs') {
       return [['分屏要用「横排」布局（点顶部横排）', function () {
@@ -1125,7 +1162,7 @@
 
   function clearDropZone() {
     if (!dropState) return;
-    dropState.paneEl.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom');
+    dropState.paneEl.classList.remove('droptgt', 'dz-left', 'dz-right', 'dz-top', 'dz-bottom', 'dz-center');
     dropState = null;
   }
 
@@ -1140,6 +1177,7 @@
     else if ((r.right - x) / r.width < edge) zone = 'right';
     else if ((y - r.top) / r.height < edge) zone = 'top';
     else if ((r.bottom - y) / r.height < edge) zone = 'bottom';
+    else if (layoutMode === 'grid') zone = 'center';   // 宫格: the whole cell = 换掉这格
     if (!zone) { clearDropZone(); return null; }
     if (!dropState || dropState.paneEl !== paneEl || dropState.zone !== zone) {
       clearDropZone();
@@ -1175,7 +1213,10 @@
         cleanup();
         if (drop && tabs.has(id)) {
           var pid = paneIdOf(drop.paneEl);
-          if (pid && pid !== id && tabs.has(pid)) movePane(id, pid, drop.zone);
+          if (pid && pid !== id && tabs.has(pid)) {
+            if (layoutMode === 'grid') gridDrop(id, pid, drop.zone);  // 宫格: 上墙/换位
+            else movePane(id, pid, drop.zone);                        // 横排: 分屏
+          }
         }
       }
       function cancel() { cleanup(); }
@@ -1191,7 +1232,9 @@
   /* ---------------- layout modes: 横排 / 宫格 / 分组 ----------------
    *
    * tabs    : classic strip + one terminal on stage (draggable splits).
-   * grid    : every terminal gets a cell in an auto grid; click a cell to focus.
+   * grid    : a manual "wall" of cells — a terminal only gets a cell once you
+   *           drag its tab in (or click it); drag between cells to re-order,
+   *           drop on a cell centre to replace it, drop on an edge to insert.
    * grouped : terminals are grouped by the directory their shell sits in (or by
    *           the directory of the opencode session they run), the rail picks a
    *           group and the strip only shows that group's tabs.
@@ -1202,14 +1245,18 @@
 
   var MODE_KEY = 'webterm.layoutmode.v1';
   var GRIDCOL_KEY = 'webterm.gridcol.v1';
+  var GRID_KEY = 'webterm.gridwall.v1';   // 宫格: which terminals are on the wall
   var GROUP_KEY = 'webterm.navgroup.v1';
   var LAYOUT_MODES = ['tabs', 'grid', 'grouped'];
   var MODE_LABEL = { tabs: '横排标签', grid: '宫格平铺', grouped: '按目录分组' };
   var TAB_MORE_W = 76;                    // width reserved for the "⋯ n" button
   var CWDS_MS = 5000;                     // how often grouped mode re-asks for cwds
+  var GRID_MAX = 9;                       // most cells on the 宫格 wall
 
   var layoutMode = 'tabs';
   var gridCols = 0;                       // 0 = pick columns automatically
+  var gridWall = [];                      // 宫格: tab ids on the wall, in order
+  var wallLock = false;                   // true while tabs are being restored
   var curGroup = null;                    // selected group key (grouped mode)
   var groupFocus = Object.create(null);   // group key -> last focused tab id
   var tabMoreList = [];                   // ids the strip could not show
@@ -1351,7 +1398,124 @@
     if (next) activate(next);
   }
 
-  /* ---- 宫格 ---- */
+  /* ---- 宫格: a wall you build by dragging tabs in ----
+   *
+   * A terminal only gets a cell once it is "on the wall": drag its tab into the
+   * stage (drop near an edge to insert beside a cell, on the middle to replace
+   * it), or just click the tab.  Nothing is added behind your back, and the wall
+   * is remembered per browser.
+   */
+
+  function saveWall() { lsSet(GRID_KEY, JSON.stringify(gridWall)); }
+
+  function wallHas(id) { return gridWall.indexOf(id) >= 0; }
+
+  // The focused terminal must be visible: put it on the wall if it is missing.
+  function wallEnsure(id) {
+    if (layoutMode !== 'grid' || wallLock) return false;
+    if (!id || !tabs.has(id) || wallHas(id)) return false;
+    if (gridWall.length >= GRID_MAX) {
+      toast('宫格最多 ' + GRID_MAX + ' 格：先「✕ 移出」几格再放');
+      return false;
+    }
+    gridWall.push(id);
+    saveWall();
+    renderLayout();
+    scheduleTabbar();
+    return true;
+  }
+
+  function wallRemove(id) {
+    var i = gridWall.indexOf(id);
+    if (i < 0 || layoutMode !== 'grid') return;
+    gridWall.splice(i, 1);
+    if (!gridWall.length) {
+      // never leave the stage blank: keep some other terminal (it stays open)
+      var spare = null;
+      tabs.forEach(function (t, tid) { if (!spare && tid !== id) spare = tid; });
+      if (spare) gridWall.push(spare);
+      else {
+        gridWall.push(id);
+        toast('宫格至少要留一格');
+        return;
+      }
+    }
+    saveWall();
+    renderLayout();                       // sanitizeWall() keeps the wall sane
+    scheduleTabbar();
+    toast('已移出宫格：终端还在标签栏里，点标签或拖回来即可重新上墙');
+  }
+
+  function wallAll() {
+    var ids = [];
+    tabs.forEach(function (t, id) { ids.push(id); });
+    gridWall = ids.slice(0, GRID_MAX);
+    saveWall();
+    renderLayout();
+    scheduleTabbar();
+    toast(ids.length > GRID_MAX
+      ? '已把前 ' + GRID_MAX + ' 个终端全部上墙（宫格最多 ' + GRID_MAX + ' 格）'
+      : '已把 ' + gridWall.length + ' 个终端全部上墙');
+  }
+
+  function wallOne() {
+    var keep = (activeId && tabs.has(activeId)) ? activeId : null;
+    if (!keep) tabs.forEach(function (t, id) { if (!keep) keep = id; });
+    gridWall = keep ? [keep] : [];
+    saveWall();
+    renderLayout();
+    scheduleTabbar();
+    toast('只留当前终端：把其它标签拖进画面即可拼墙');
+  }
+
+  // Forget closed tabs, never leave the wall empty, cap the number of cells.
+  function sanitizeWall() {
+    if (wallLock) return gridWall;         // tabs are still being restored at boot
+    var seen = Object.create(null), out = [];
+    gridWall.forEach(function (id) {
+      if (typeof id === 'string' && !seen[id] && tabs.has(id)) { seen[id] = 1; out.push(id); }
+    });
+    if (!out.length && tabs.size && !wallLock) {
+      var first = (activeId && tabs.has(activeId)) ? activeId : null;
+      if (!first) tabs.forEach(function (t, id) { if (!first) first = id; });
+      if (first) out.push(first);
+    }
+    out = out.slice(0, GRID_MAX);
+    var same = out.length === gridWall.length;
+    for (var i = 0; same && i < out.length; i++) if (out[i] !== gridWall[i]) same = false;
+    gridWall = out;
+    if (!same) saveWall();
+    return gridWall;
+  }
+
+  // A tab was dropped on a cell: insert next to it, or take its place.
+  function gridDrop(id, targetId, zone) {
+    if (!tabs.has(id) || !tabs.has(targetId) || id === targetId) return;
+    var before = gridWall.slice();
+    var from = gridWall.indexOf(id);
+    if (from >= 0) gridWall.splice(from, 1);
+    var ti = gridWall.indexOf(targetId);
+    if (zone === 'center') {
+      if (ti < 0) gridWall.push(id); else gridWall.splice(ti, 1, id);
+    } else if (ti < 0) {
+      gridWall.push(id);
+    } else {
+      gridWall.splice((zone === 'left' || zone === 'top') ? ti : ti + 1, 0, id);
+    }
+    if (gridWall.length > GRID_MAX) {
+      gridWall = before;
+      toast('宫格最多 ' + GRID_MAX + ' 格');
+      return;
+    }
+    saveWall();
+    renderLayout();
+    scheduleTabbar();
+    activate(id);
+    var label = tabs.get(id).labelEl.textContent || '终端';
+    toast(zone === 'center'
+      ? '「' + label + '」换到了这一格'
+      : '「' + label + '」已放到' + (SIDE_LABEL[zone] || '宫格里'));
+  }
 
   function gridColumnCount(n) {
     if (gridCols > 0) return Math.max(1, Math.min(gridCols, n));
@@ -1361,9 +1525,9 @@
   }
 
   function applyGrid() {
-    var n = tabs.size;
-    if (!n) { panes.style.gridTemplateColumns = ''; return; }
-    var c = gridColumnCount(n);
+    var ids = sanitizeWall();
+    if (!ids.length) { panes.style.gridTemplateColumns = ''; return; }
+    var c = gridColumnCount(ids.length);
     panes.style.gridTemplateColumns = 'repeat(' + c + ', minmax(0, 1fr))';
     panes.dataset.cols = String(c);                  // handy when debugging
   }
@@ -1390,6 +1554,7 @@
     tabs.forEach(function (t, id) {
       var inBar = !!allowed[id];
       t.tabEl.style.display = inBar ? '' : 'none';
+      t.tabEl.classList.toggle('on-wall', layoutMode === 'grid' && wallHas(id));
       if (inBar) cands.push(id);
     });
 
@@ -1435,7 +1600,8 @@
           (function (k) { return function () { selectGroup(k); }; })(g), 'head']);
       }
       ids.forEach(function (id) {
-        var mark = (id === activeId) ? '✓ ' : '';
+        var mark = (id === activeId) ? '✓ '
+                 : ((layoutMode === 'grid' && wallHas(id)) ? '▦ ' : '');
         items.push([mark + tabLabelOf(id),
           (function (i) { return function () { activate(i); }; })(id)]);
       });
@@ -1454,9 +1620,14 @@
     });
     groupsEl.classList.toggle('hidden', mode !== 'grouped');
     gridColsEl.classList.toggle('show', mode === 'grid');
+    gridActsEl.classList.toggle('show', mode === 'grid');
     if (mode === 'grouped') { ensureGroup(); requestCwds(); }
     renderLayout();
-    if (!quiet) toast('布局：' + MODE_LABEL[mode]);
+    if (!quiet) {
+      toast(mode === 'grid'
+        ? '宫格：把标签拖进画面占一格（拖到格子中间=替换那格，✕ 移出=下墙）'
+        : '布局：' + MODE_LABEL[mode]);
+    }
   }
 
   function chooseLayoutMode(mode) {
@@ -1513,6 +1684,10 @@
     var savedGroup = lsGet(GROUP_KEY);
     curGroup = (savedGroup === null) ? null : savedGroup;
 
+    var sWall = [];
+    try { sWall = JSON.parse(lsGet(GRID_KEY) || '[]'); } catch (e) { sWall = []; }
+    gridWall = (Object.prototype.toString.call(sWall) === '[object Array]') ? sWall : [];
+
     Array.prototype.forEach.call(layoutSwEl.children, function (b) {
       b.addEventListener('click', function () { chooseLayoutMode(b.dataset.mode); });
     });
@@ -1521,6 +1696,8 @@
       lsSet(GRIDCOL_KEY, String(gridCols));
       if (layoutMode === 'grid') renderLayout();
     });
+    wallAllBtn.addEventListener('click', function () { if (layoutMode === 'grid') wallAll(); });
+    wallOneBtn.addEventListener('click', function () { if (layoutMode === 'grid') wallOne(); });
     tabMoreBtn.addEventListener('click', function (e) {
       e.stopPropagation();
       showTabMoreMenu();
@@ -1867,6 +2044,7 @@
   document.addEventListener('dragover', function (e) { e.preventDefault(); });
   document.addEventListener('drop', function (e) { e.preventDefault(); });
 
+  wallLock = true;                             // do not grow the 宫格 wall while restoring
   initLayout();                                // before the restore loop: tabs land
   initNav();                                   // in the right layout right away
   connect();
@@ -1885,5 +2063,10 @@
     }
   } else {
     createTab();
+  }
+  wallLock = false;
+  if (layoutMode === 'grid') {                 // drop dead ids, keep the wall sane
+    sanitizeWall();
+    renderLayout();
   }
 })();
