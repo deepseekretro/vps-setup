@@ -19,6 +19,11 @@ VNC_USER="vncuser1"
 SWAP_SIZE="2G"
 SWAP_FILE="/swapfile"
 
+# 账号密码记录文件（root 私有，600）：
+#   只在这里记录「明文」的桌面用户密码与 VNC 连接密码，供菜单 [11] 查看。
+#   注意：绝不要放进仓库（仓库是公开的）。
+CRED_FILE="/root/.vnc-desktop-credentials"
+
 update_variables() {
     USER_HOME="/home/${VNC_USER}"
     NOVNC_WEB_ROOT="/usr/share/novnc"
@@ -60,6 +65,30 @@ configure_username() {
     sleep 1
 }
 
+# -------------------------------------------------------
+# 凭据记录：/root/.vnc-desktop-credentials (600)
+#   每行 KEY=VALUE：VNC_USER / DESKTOP_PASS / VNC_PASS
+#   读取不用 source，避免密码里的特殊字符被 shell 解析。
+# -------------------------------------------------------
+cred_get() {
+    [ -f "${CRED_FILE}" ] || return 1
+    local v
+    v=$(sed -n "s|^$1=||p" "${CRED_FILE}" 2>/dev/null | head -1)
+    [ -n "${v}" ] || return 1
+    printf '%s' "${v}"
+}
+
+cred_set() {
+    local key="$1" val="$2" tmp
+    touch "${CRED_FILE}"
+    chmod 600 "${CRED_FILE}"
+    tmp=$(mktemp)
+    grep -v "^${key}=" "${CRED_FILE}" > "${tmp}" 2>/dev/null || true
+    printf '%s=%s\n' "${key}" "${val}" >> "${tmp}"
+    cat "${tmp}" > "${CRED_FILE}"
+    rm -f "${tmp}"
+}
+
 # 判断账户是否有「可用的」Linux 密码（passwd -S 第二列 = P 才算可用）
 #   L  = 锁定/无密码 —— adduser --disabled-password 建出来的就是这个，sudo 必然认证失败
 #   NP = 无密码
@@ -80,35 +109,115 @@ verify_user_password() {
     fi
 }
 
-# 账户已存在时也要确认密码真的落地（老版本"已存在就跳过"会把这个坑静默掉）
-ensure_user_password() {
-    if ! id "${VNC_USER}" &>/dev/null; then
-        echo "ℹ️ 用户 ${VNC_USER} 尚不存在，跳过密码检查。"
-        return 0
+# 交互读取两遍密码（不回显）；成功返回 0 并把明文放进 READ_PASS
+read_new_password() {
+    local prompt="$1" max="${2:-0}" p1 p2
+    if [ ! -t 0 ]; then
+        echo "ℹ️ 当前不是交互终端，无法读取密码。"
+        return 1
     fi
-
-    if user_has_no_password; then
-        echo "========================================"
-        echo "⚠️ 用户 ${VNC_USER} 当前没有可用的 Linux 密码"
-        echo "   （/etc/shadow 为 ! 状态 → sudo 一定认证失败；"
-        echo "     它和 VNC 连接密码 ~/.vnc/passwd 不是一回事）"
-        echo "========================================"
-        read -p "现在为 ${VNC_USER} 设置 Linux 密码？[y/N]: " setpw
-        case "${setpw}" in
-            [yY]*)
-                passwd "${VNC_USER}"
-                verify_user_password
-                ;;
-            *)
-                echo "ℹ️ 已跳过。之后可随时执行：passwd ${VNC_USER}"
-                ;;
-        esac
-    else
-        echo "✅ 用户 ${VNC_USER} 已有可用的 Linux 密码（可用于 sudo）。"
-    fi
+    while true; do
+        read -r -s -p "${prompt}: " p1 || { echo; echo "  ℹ️ 输入结束（EOF/Ctrl+D），已取消。"; return 1; }
+        echo
+        [ -z "${p1}" ] && { echo "  ⚠️ 不能为空，请重试（Ctrl+C 可放弃）"; continue; }
+        if [ "${max}" -gt 0 ] && [ "${#p1}" -gt "${max}" ]; then
+            echo "  ⚠️ 最多 ${max} 位（当前 ${#p1} 位），请重试"; continue
+        fi
+        read -r -s -p "请再输入一次确认: " p2 || { echo; echo "  ℹ️ 输入结束（EOF/Ctrl+D），已取消。"; return 1; }
+        echo
+        [ "${p1}" = "${p2}" ] || { echo "  ⚠️ 两次输入不一致，请重试"; continue; }
+        break
+    done
+    READ_PASS="${p1}"
+    return 0
 }
 
-# 创建/补齐桌面运行用户（幂等：已存在则只补组与目录，不重复要密码）
+# 设置桌面用户 Linux 密码（只设这一次），并记录明文到凭据文件
+set_desktop_password() {
+    echo "🔑 设置 ${VNC_USER} 的 Linux 密码（sudo/本地登录用；与 VNC 连接密码不是一回事）"
+    if [ -t 0 ]; then
+        read_new_password "请输入 ${VNC_USER} 的新密码" || {
+            echo "ℹ️ 已取消。之后可用菜单 [11] 或 passwd ${VNC_USER} 设置。"
+            return 1
+        }
+    else
+        # 非交互（脚本化安装）：自动生成并记录，绝不把"没有密码"静默略过
+        READ_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
+        echo "ℹ️ 非交互终端：已自动生成随机密码（菜单 [11] 可查看）"
+    fi
+    printf '%s:%s\n' "${VNC_USER}" "${READ_PASS}" | chpasswd
+    if user_has_no_password; then
+        echo "⚠️ 密码写入失败（/etc/shadow 仍不可用）。稍后可执行：passwd ${VNC_USER}"
+        return 1
+    fi
+    cred_set DESKTOP_PASS "${READ_PASS}"
+    echo "✅ 已设置并记录密码（菜单 [11] 可查看）"
+    return 0
+}
+
+# 设置 VNC 连接密码（只设这一次），并记录明文；VNC 协议上限 8 位
+set_vnc_password() {
+    echo "🔑 设置 VNC 连接密码（noVNC 网页里输入的密码；VNC 协议上限 8 位）"
+    if [ -t 0 ]; then
+        read_new_password "请输入 VNC 连接密码" 8 || {
+            echo "ℹ️ 已取消。之后可用菜单 [11] 重设。"
+            return 1
+        }
+    else
+        READ_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 8)
+        echo "ℹ️ 非交互终端：已自动生成随机 VNC 密码（菜单 [11] 可查看）"
+    fi
+    mkdir -p "${VNC_CONF_DIR}"
+    if ! x11vnc -storepasswd "${READ_PASS}" "${VNC_PASSWD_FILE}" >/dev/null 2>&1; then
+        echo "❌ x11vnc -storepasswd 执行失败，VNC 密码未改动"
+        return 1
+    fi
+    chown ${VNC_USER}:${VNC_USER} "${VNC_PASSWD_FILE}" 2>/dev/null || true
+    chmod 600 "${VNC_PASSWD_FILE}"
+    cred_set VNC_PASS "${READ_PASS}"
+    echo "✅ 已设置并记录 VNC 连接密码（若 x11vnc 正在运行：systemctl restart x11vnc@1）"
+    return 0
+}
+
+# 确保桌面账户有可用密码，并把明文记录到凭据文件
+ensure_recorded_desktop_password() {
+    if ! user_has_no_password; then
+        if cred_get DESKTOP_PASS >/dev/null; then
+            echo "✅ 桌面用户 ${VNC_USER} 已有可用密码（已记录，菜单 [11] 可查看）"
+        else
+            echo "✅ 桌面用户 ${VNC_USER} 已有可用密码（历史设置、明文未记录；如需展示可在菜单 [11] 重设）"
+        fi
+        return 0
+    fi
+    echo "========================================"
+    echo "⚠️ 用户 ${VNC_USER} 当前没有可用的 Linux 密码"
+    echo "   （/etc/shadow 为 ! 状态 → sudo 一定认证失败；"
+    echo "     它和 VNC 连接密码 ~/.vnc/passwd 不是一回事）"
+    echo "   这里只需设置这一次，之后不再询问。"
+    echo "========================================"
+    set_desktop_password
+}
+
+# VNC 连接密码：文件已存在就不覆盖（只设置一次）；明文未记录时提示可用菜单 [11] 重设
+ensure_vnc_password() {
+    if [ -f "${VNC_PASSWD_FILE}" ]; then
+        chmod 600 "${VNC_PASSWD_FILE}" 2>/dev/null || true
+        if cred_get VNC_PASS >/dev/null; then
+            echo "✅ VNC 连接密码已存在且已记录（菜单 [11] 可查看）"
+        else
+            echo "✅ VNC 连接密码文件已存在（历史设置、明文未记录；如需展示可在菜单 [11] 重设）"
+        fi
+        return 0
+    fi
+    echo "========================================"
+    echo "🔑 首次设置 VNC 连接密码（只设这一次，之后不再询问）"
+    echo "   用途：noVNC 网页里输入的密码；VNC 协议上限 8 位。"
+    echo "========================================"
+    set_vnc_password
+}
+
+# 创建/补齐桌面运行用户（幂等：已存在则只补组与目录）
+# 密码统一交给 ensure_desktop_user_and_password 处理，避免各菜单反复追问
 create_desktop_user() {
     if ! id "${VNC_USER}" &>/dev/null; then
         echo "📁 创建服务用户 ${VNC_USER}..."
@@ -117,19 +226,62 @@ create_desktop_user() {
 
         echo "📁 正在强制生成英文基础目录..."
         su - ${VNC_USER} -c "LC_ALL=C xdg-user-dirs-update --force"
-
-        echo "🔑 设置用户 ${VNC_USER} 密码："
-        passwd ${VNC_USER}
-        verify_user_password
     else
         echo "ℹ️ 用户 ${VNC_USER} 已存在，跳过创建（仅补齐组与目录）。"
         usermod -aG sudo ${VNC_USER} 2>/dev/null || true
-        ensure_user_password
     fi
 
     mkdir -p ${USER_HOME}/Desktop ${USER_HOME}/.vnc ${USER_HOME}/.config/autostart
     chown -R ${VNC_USER}:${VNC_USER} ${USER_HOME}
     loginctl enable-linger ${VNC_USER} 2>/dev/null || true
+}
+
+# -------------------------------------------------------
+# 桌面用户 + 密码：全程只设置一次
+#   首次：询问一次用户名（默认 vncuser1）→ 建账户 → 设一次密码 → 记录到凭据文件
+#   之后：凭据文件里已有用户名且账户密码可用 → 直接跳过，不再询问
+#   查看 / 重设：见菜单 [11]（或 --show-credentials）
+# -------------------------------------------------------
+ensure_desktop_user_and_password() {
+    local stored reset_choice
+    stored=$(cred_get VNC_USER)
+
+    # 已配置好 → 不打扰用户
+    if [ -n "${stored}" ]; then
+        VNC_USER="${stored}"
+        update_variables
+        if id "${VNC_USER}" &>/dev/null && ! user_has_no_password; then
+            echo "ℹ️ 桌面用户已配置：${VNC_USER}（跳过用户名/密码设置；查看或重设见菜单 [11]）"
+            create_desktop_user >/dev/null 2>&1 || true
+            return 0
+        fi
+    fi
+
+    # 首次配置：只在这里询问一次用户名
+    if [ -z "${stored}" ]; then
+        configure_username
+        cred_set VNC_USER "${VNC_USER}"
+
+        # 历史安装的账户已存在时，给一次「保留 / 重置」选择
+        if id "${VNC_USER}" &>/dev/null; then
+            echo "========================================"
+            echo "⚠️ 检测到用户 ${VNC_USER} 已存在！"
+            echo "========================================"
+            echo " [1] 保留现有数据（仅修复组权限并确认密码）[默认]"
+            echo " [2] 彻底重置用户（清空家目录，重新生成纯净英文环境）"
+            read -p "请选择处理方式 [1/2, 默认 1]: " reset_choice
+            if [ "${reset_choice}" = "2" ]; then
+                echo "⚠️ 正在彻底清理并重置用户 ${VNC_USER}..."
+                pkill -u "${VNC_USER}" 2>/dev/null || true
+                deluser --remove-home "${VNC_USER}" >/dev/null 2>&1 || true
+            else
+                echo "ℹ️ 已选择保留现有用户 ${VNC_USER} 及全部数据。"
+            fi
+        fi
+    fi
+
+    create_desktop_user
+    ensure_recorded_desktop_password
 }
 
 # =======================================================
@@ -357,9 +509,9 @@ setup_swap() {
 }
 
 setup_system_and_user_and_locale() {
-    # 桌面运行用户在此确定（模块入口不再统一询问）
-    echo "--- 0. 设置桌面运行用户 ---"
-    configure_username
+    # 桌面运行用户 + 密码：只设置一次（已有记录则直接跳过）
+    echo "--- 0. 设置桌面运行用户（只设置一次）---"
+    ensure_desktop_user_and_password
 
     echo "--- 1. 更新系统与基础依赖 ---"
     setup_swap
@@ -389,35 +541,7 @@ setup_system_and_user_and_locale() {
 
     timedatectl set-timezone Asia/Shanghai
 
-    # --- 用户创建与防误删选择 ---
-    local need_create_user=1
-    if id "${VNC_USER}" &>/dev/null; then 
-        echo "========================================"
-        echo "⚠️ 检测到用户 ${VNC_USER} 已存在！"
-        echo "========================================"
-        echo " [1] 保留现有数据（仅修复组权限，不删家目录）[默认]"
-        echo " [2] 彻底重置用户（清空家目录，重新生成纯净英文环境）"
-        read -p "请选择处理方式 [1/2, 默认 1]: " reset_choice
-        case "$reset_choice" in
-            2)
-                echo "⚠️ 正在彻底清理并重置用户 ${VNC_USER}..."
-                pkill -u "${VNC_USER}" 2>/dev/null || true
-                deluser --remove-home "${VNC_USER}" || true
-                need_create_user=1
-                ;;
-            *)
-                echo "ℹ️ 已选择保留现有用户 ${VNC_USER} 及全部数据。"
-                usermod -aG sudo ${VNC_USER}
-                need_create_user=0
-                # 保留现有用户时 create_desktop_user 不会被调用，这里单独补一次密码检查
-                ensure_user_password
-                ;;
-        esac
-    fi
-
-    if [ "$need_create_user" -eq 1 ]; then
-        create_desktop_user
-    fi
+    # 账户与密码已在上面的 ensure_desktop_user_and_password 里统一处理（只设一次）
 
     # 启用用户会话永久驻留（防止无 SSH 连接时被系统回收）
     su - ${VNC_USER} -c "im-config -n fcitx"
@@ -425,12 +549,9 @@ setup_system_and_user_and_locale() {
 }
 
 install_lxde_desktop() {
-    # 安装桌面核心前，先设置「桌面运行用户」：
-    # LXDE / Xvfb / x11vnc / MT5 全部以该用户身份运行。模块入口不再统一询问，
-    # 用户在此确定；并同步刷新 USER_HOME 等派生变量，用户不存在则一并创建（幂等）。
-    echo "--- 0. 设置桌面运行用户 ---"
-    configure_username
-    create_desktop_user
+    # 用户名/密码只设置一次：已有记录则直接跳过（不再询问），查看/重设见菜单 [11]。
+    echo "--- 0. 桌面运行用户（只设置一次）---"
+    ensure_desktop_user_and_password
 
     echo "--- 安装 LXDE 桌面核心 ---"
     apt install -y --no-install-recommends ${PKG_LXDE} ${DBUS_PACKAGE}
@@ -1070,10 +1191,7 @@ EOF
 activate_pipeline_services() {
     echo "--- 配置 VNC 密码与启动级联服务 ---"
 
-    if [ ! -f "${VNC_PASSWD_FILE}" ]; then
-        su - ${VNC_USER} -c "mkdir -p ~/.vnc; x11vnc -storepasswd ${VNC_PASSWD_FILE}"
-        chmod 600 ${VNC_PASSWD_FILE}
-    fi
+    ensure_vnc_password
 
     setup_mt5_watchdog_script
     create_pipeline_res_tool
@@ -1109,6 +1227,84 @@ activate_pipeline_services() {
     echo "=========================================================="
 }
 
+# -------------------------------------------------------
+# 账号密码一览（菜单 [11] / --show-credentials）
+# -------------------------------------------------------
+print_credentials() {
+    local u dp vp ip state
+    u=$(cred_get VNC_USER); u=${u:-${VNC_USER}}
+    dp=$(cred_get DESKTOP_PASS)
+    vp=$(cred_get VNC_PASS)
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}'); ip=${ip:-<服务器IP>}
+
+    echo "=========================================================="
+    echo "                 🖥️  桌面 / VNC 账号密码"
+    echo "=========================================================="
+    echo " 桌面运行用户 (Linux) : ${u}"
+    if [ -n "${dp}" ]; then
+        echo " 桌面用户密码         : ${dp}"
+    else
+        echo " 桌面用户密码         : （未记录 —— 用下方 [1] 重设）"
+    fi
+    if id "${u}" &>/dev/null; then
+        state=$(passwd -S "${u}" 2>/dev/null | awk '{print $2}')
+        if [ "${state}" = "P" ]; then
+            echo "   └ 实时核对: 账户存在，密码可用 ✅"
+        else
+            echo "   └ 实时核对: 账户存在，但密码不可用 ⚠️（用下方 [1] 设置）"
+        fi
+    else
+        echo "   └ 实时核对: 账户不存在 ⚠️"
+    fi
+    echo "   用途: sudo / 本地登录；与 VNC 连接密码不是一回事。"
+    echo
+    echo " VNC 连接用户         : ${u}   （x11vnc 只认证密码，没有独立用户名）"
+    if [ -n "${vp}" ]; then
+        echo " VNC 连接密码         : ${vp}"
+    else
+        echo " VNC 连接密码         : （未记录 —— 用下方 [2] 重设）"
+    fi
+    if [ -f "${VNC_PASSWD_FILE}" ]; then
+        echo "   └ 密码文件: ${VNC_PASSWD_FILE} （存在）"
+    else
+        echo "   └ 密码文件: ${VNC_PASSWD_FILE} （缺失，用下方 [2] 生成）"
+    fi
+    echo "   注意: VNC 协议密码上限 8 位，超出部分无效。"
+    echo
+    echo " 访问地址             : https://<你的服务器公网IP>/vnc1"
+    echo "   └ 本机 IP: ${ip}（容器/内网地址，仅供参考；自签证书需点「继续访问」）"
+    if [ -f "${CRED_FILE}" ]; then
+        echo " 凭据记录文件         : ${CRED_FILE} (权限 $(stat -c %a "${CRED_FILE}" 2>/dev/null))"
+    else
+        echo " 凭据记录文件         : ${CRED_FILE} (尚未生成)"
+    fi
+    echo "=========================================================="
+}
+
+show_credentials() {
+    local c cur
+    while true; do
+        clear
+        print_credentials
+        echo " [1] 重设桌面用户密码    [2] 重设 VNC 连接密码    [0] 返回"
+        read -p "请选择: " c
+        cur=$(cred_get VNC_USER); cur=${cur:-${VNC_USER}}
+        case "${c}" in
+            1)
+                VNC_USER="${cur}"; update_variables
+                set_desktop_password || true
+                read -p "按回车返回..." _
+                ;;
+            2)
+                VNC_USER="${cur}"; update_variables
+                set_vnc_password || true
+                read -p "按回车返回..." _
+                ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         clear
@@ -1125,6 +1321,7 @@ main_menu() {
         echo " [8] 安装 Gost 隧道代理 (Systemd 微服务版)"
         echo " [9] 查看各微服务运行状态 (systemctl)"
         echo " [10] 屏蔽桌面「注销/关机/屏幕锁」(桌面加固)"
+        echo " [11] 查看 / 重设 桌面与 VNC 账号密码"
         echo " [99] 停止所有服务 (VNC级联与Gost)"
         echo " [0] 退出"
         read -p "选项: " c
@@ -1152,6 +1349,7 @@ main_menu() {
                 echo "🔄 正在重启桌面会话以让面板配置生效..."
                 systemctl restart vnc-desktop@1 2>/dev/null || true
                 ;;
+            11) show_credentials ;;
             0) exit 0 ;;
         esac
         read -p "按回车继续..."
@@ -1162,7 +1360,8 @@ check_root
 
 # 模块入口不再询问桌面运行用户，只按默认/当前 VNC_USER 初始化派生路径
 # （USER_HOME、.vnc、Desktop 等，供 [3]-[8] 使用）。
-# 桌面运行用户改由 [1] 初始化系统环境 / [2] 安装 LXDE 桌面核心 各自设置。
+# 桌面运行用户 + 密码：由 [1] / [2] 调用 ensure_desktop_user_and_password 统一处理，
+# 只设置一次（记录在 /root/.vnc-desktop-credentials）；查看/重设见菜单 [11]。
 update_variables
 
 # 非交互入口：--harden [用户名]
@@ -1191,6 +1390,17 @@ if [ "${1:-}" = "--res-tool" ]; then
     systemctl restart vnc-res-watch.path 2>/dev/null || true
     echo "✅ 免 root 分辨率通道就绪：vnc-res-watch.path"
     echo "✅ 桌面工具已刷新：${DESKTOP_DIR}/切换分辨率(Systemd版).sh"
+    exit 0
+fi
+
+# 非交互入口：--show-credentials [用户名]
+#   打印桌面运行用户 / 密码 与 VNC 连接用户 / 密码（读取 /root/.vnc-desktop-credentials）
+if [ "${1:-}" = "--show-credentials" ]; then
+    check_root
+    _u=$(cred_get VNC_USER); [ -n "${_u}" ] && VNC_USER="${_u}"
+    [ -n "${2:-}" ] && VNC_USER="$2"
+    update_variables
+    print_credentials
     exit 0
 fi
 
