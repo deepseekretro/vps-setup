@@ -1592,6 +1592,10 @@ print_credentials() {
         [ -n "${vp_port}" ] && [ "${vp_port}" != "443" ] && vurl="https://<你的服务器公网IP>:${vp_port}/vnc1"
     fi
     echo " 访问地址             : ${vurl}"
+    # 若已按 README 附录把 noVNC 挂到现有 443 站点的 /novnc/，顺手提示同端口入口
+    if grep -rqsE 'include[[:space:]]+[^;]*novnc-proxy\.inc' "${OR_CONF_DIR}" 2>/dev/null; then
+        echo "   └ 443 上也可用（已挂 /novnc/ 反代）: https://<你的服务器公网IP>/vnc1"
+    fi
     echo "   └ 本机 IP: ${ip}（容器/内网地址，仅供参考；自签证书需点「继续访问」）"
     if [ -f "${CRED_FILE}" ]; then
         echo " 凭据记录文件         : ${CRED_FILE} (权限 $(stat -c %a "${CRED_FILE}" 2>/dev/null))"
