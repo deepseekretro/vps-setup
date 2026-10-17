@@ -18,6 +18,7 @@ set -euo pipefail
 #   --port 443              监听 UDP 端口
 #   --domain bing.com       SNI / 自签证书 CN
 #   --mask-url URL          masquerade 伪装目标（默认 https://bing.com/）
+#   --no-qr                 不输出二维码
 #   --new-password          强制重新生成随机密码
 #   --keep-password         沿用已有密码（默认交互询问）
 # ============================================
@@ -38,6 +39,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 MODE="menu"
 DRY=0
+QR=1
 FORCE_NEW_PASS=0
 KEEP_PASS=0
 ASSUME_YES=0
@@ -71,10 +73,11 @@ while [[ $# -gt 0 ]]; do
     --port)          PORT="$2";        shift 2 ;;
     --domain)        DOMAIN="$2";      shift 2 ;;
     --mask-url)      MASK_URL="$2";    shift 2 ;;
+    --no-qr)         QR=0;             shift ;;
     --new-password)  FORCE_NEW_PASS=1; shift ;;
     --keep-password) KEEP_PASS=1;      shift ;;
     -y|--yes)        ASSUME_YES=1;     shift ;;
-    -h|--help)       sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,24p' "$0"; exit 0 ;;
     *) err "未知参数: $1（--help 看用法）"; exit 1 ;;
   esac
 done
@@ -161,10 +164,13 @@ require_host() {
 # ─────────────── 安装相关 ───────────────
 ensure_deps() {
   log "检查依赖"
-  local miss=()
+  local miss=() opt=()
   for c in curl jq openssl; do
     command -v "$c" &> /dev/null || miss+=("$c")
   done
+  # qrencode 只用于终端二维码展示，属可选依赖
+  command -v qrencode &> /dev/null || opt+=("qrencode")
+
   if (( ${#miss[@]} )); then
     if (( DRY )); then
       echo "   [dry-run] apt-get install -y ${miss[*]} ca-certificates"
@@ -175,6 +181,20 @@ ensure_deps() {
     fi
   else
     ok "依赖齐全（curl / jq / openssl）"
+  fi
+
+  if (( ${#opt[@]} )); then
+    if (( DRY )); then
+      echo "   [dry-run] apt-get install -y ${opt[*]}（可选，用于输出二维码）"
+    elif (( QR )); then
+      if apt-get install -y "${opt[@]}" >/dev/null 2>&1; then
+        ok "已安装可选依赖：${opt[*]}（用于二维码）"
+      else
+        warn "可选依赖 ${opt[*]} 安装失败，将不显示二维码"
+      fi
+    fi
+  else
+    ok "二维码依赖就绪（qrencode）"
   fi
 }
 
@@ -322,7 +342,9 @@ do_install() {
       echo ""
       print_info "检测到已有配置 ${CONFIG_FILE}"
       local ans=""
-      read -p "保留现有密码？(Y=保留 / n=生成新随机密码): " ans
+      # 非交互（无 tty / 管道 / 被其它脚本调用）时 read 会失败，
+      # set -e 下会直接中断，这里兜住并按默认「保留」处理
+      read -p "保留现有密码？(Y=保留 / n=生成新随机密码): " ans || true
       if [[ "$ans" == "n" || "$ans" == "N" ]]; then
         pass=$(randpass)
         ok "已生成新随机密码"
@@ -376,11 +398,28 @@ do_install() {
 }
 
 # ─────────────── 状态 / 信息 ───────────────
+print_qr() { # print_qr <内容>：用 qrencode 在终端渲染二维码
+  local text="$1"
+  (( QR )) || return 0
+  [[ -n "$text" ]] || return 0
+  if ! command -v qrencode &> /dev/null; then
+    echo "  （未安装 qrencode，跳过二维码：apt-get install -y qrencode）"
+    return 0
+  fi
+  echo " 扫码导入（手机客户端）："
+  echo ""
+  if ! qrencode -t ANSIUTF8 -m 1 "$text" 2>/dev/null; then
+    qrencode -t UTF8 -m 1 "$text" || warn "二维码渲染失败"
+  fi
+  echo ""
+}
+
 print_conn_info() {
   local pass="${1:-$(current_pass || true)}"
   local ver="${2:-未知}"
-  local ip
+  local ip link
   ip=$(get_public_ip)
+  link="hy2://${pass}@${ip}:${PORT}/?sni=${DOMAIN}&insecure=1"
 
   echo "========================================"
   echo " Hysteria2 连接信息"
@@ -392,8 +431,10 @@ print_conn_info() {
   echo "  密码    : ${pass:-（未找到，见 ${CONFIG_FILE}）}"
   echo "----------------------------------------"
   echo " 导入链接："
-  echo " hy2://${pass}@${ip}:${PORT}/?sni=${DOMAIN}&insecure=1"
+  echo " ${link}"
   echo "========================================"
+  echo ""
+  print_qr "$link"
   echo " 提示：insecure=1 是因为使用自签证书；如已换成受信任证书可去掉。"
   echo ""
 }
@@ -437,7 +478,12 @@ show_info() {
     echo ""
     return 0
   fi
-  print_conn_info
+  local ver="未知" v=""
+  if [[ -x "$HY_BIN" ]]; then
+    v=$("$HY_BIN" version 2>/dev/null | awk -F'\t' '/^Version:/{print $2; exit}' || true)
+    if [[ -n "$v" ]]; then ver="$v"; fi
+  fi
+  print_conn_info "" "$ver"
 }
 
 do_restart() {
@@ -472,7 +518,7 @@ do_uninstall() {
     local c="y"
   else
     local c=""
-    read -p "确认卸载？(y/N): " c
+    read -p "确认卸载？(y/N): " c || true
   fi
   if [[ "$c" != "y" && "$c" != "Y" ]]; then
     print_info "已取消"
@@ -489,7 +535,7 @@ do_uninstall() {
   if (( ASSUME_YES )); then
     delcfg="n"
   else
-    read -p "是否一并删除 ${CONFIG_DIR}（含证书与密码）？(y/N): " delcfg
+    read -p "是否一并删除 ${CONFIG_DIR}（含证书与密码）？(y/N): " delcfg || true
   fi
   if [[ "$delcfg" == "y" || "$delcfg" == "Y" ]]; then
     run rm -rf "$CONFIG_DIR"
