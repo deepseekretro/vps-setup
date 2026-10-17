@@ -150,21 +150,27 @@ swap（LXC 里 `/swapfile` 还指向宿主磁盘上的文件）。因此脚本�
   `include <conf.d>/novnc-proxy.inc;`，文件内容见下文附录。
 
 **把 noVNC 挂到已有站点的 443 下（可选，附录）**：先让 `[5]` 把 noVNC 装到 `8443`
-（它会自动这么做），再新建 `/usr/local/openresty/nginx/conf/conf.d/novnc-proxy.inc`：
+（它会自动这么做），再新建 `/usr/local/openresty/nginx/conf/conf.d/novnc-proxy.inc`，
+并在你已有 443 `server {}` 里加一行 `include …/conf.d/novnc-proxy.inc;`：
 
 ```nginx
 # 由 vps-setup 生成：把 noVNC（本机 8443）挂到现有 443 站点的 /novnc/ 下
-location = /vnc1 { return 302 /novnc/vnc.html?path=websockify/1&autoconnect=true&reconnect=true; }
-location = /view { return 302 /novnc/vnc.html?path=websockify/3&view_only=true&autoconnect=true; }
-location ^~ /novnc/websockify/1 { proxy_pass http://127.0.0.1:6081/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
-location ^~ /novnc/websockify/2 { proxy_pass http://127.0.0.1:6082/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
-location ^~ /novnc/websockify/3 { proxy_pass http://127.0.0.1:6083/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; }
+location = /vnc1 { return 302 /novnc/vnc.html?path=novnc/websockify/1&autoconnect=true&reconnect=true; }
+location = /vnc2 { return 302 /novnc/vnc.html?path=novnc/websockify/2&autoconnect=true&reconnect=true; }
+location = /vnc3 { return 302 /novnc/vnc.html?path=novnc/websockify/3&autoconnect=true&reconnect=true; }
+location = /view { return 302 /novnc/vnc.html?path=novnc/websockify/3&view_only=true&autoconnect=true; }
+location ^~ /novnc/websockify/1 { proxy_pass http://127.0.0.1:6081/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; auth_basic off; }
+location ^~ /novnc/websockify/2 { proxy_pass http://127.0.0.1:6082/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; auth_basic off; }
+location ^~ /novnc/websockify/3 { proxy_pass http://127.0.0.1:6083/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "Upgrade"; proxy_buffering off; proxy_read_timeout 86400s; auth_basic off; }
 location ^~ /novnc/ { proxy_pass https://127.0.0.1:8443/; proxy_ssl_verify off; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; auth_basic off; }
 ```
 
 之后访问 `https://IP/vnc1` 即可（`auth_basic off;` 表示只由 VNC 自己的密码把关；
-想去掉这行就变成「站点密码 + VNC 密码」双重保护）。文件名故意用 `.inc` 而不是 `.conf`，
-避免被 `include conf.d/*.conf;` 在 `http` 层重复加载。
+想去掉这些行就变成「站点密码 + VNC 密码」双重保护）。两个坑已踩过：
+文件名故意用 `.inc` 而不是 `.conf`（否则会被 `include conf.d/*.conf;` 在 `http` 层重复加载而报错）；
+`path=` 必须写成 **`novnc/websockify/N`** 而不是 `websockify/N` —— noVNC 的 path 是从根拼起的
+（`app/ui.js: url += '/' + path`），而 WebSocket 通道挂在 `/novnc/` 子路径下。
+实测：443 上 `/vnc1` → 302、页面与静态资源 200、`Sec-WebSocket` 握手返回 **101**。
 
 **精简安装**：所有 apt 安装均带 `--no-install-recommends`（避免推荐包带进
 zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等数百 MiB），
