@@ -35,3 +35,22 @@ sudo bash zram-setup.sh               # 部署 / 更新
 sudo bash zram-setup.sh --status      # 状态
 sudo bash zram-setup.sh --rollback    # 回滚
 ```
+
+### Hysteria2 节点（`e. Hysteria2 节点`）
+
+`scripts/hysteria2_setup.sh` 一键部署 Hysteria2 服务端：自动拉取官方最新版、生成自签
+证书、写入 systemd 服务、放行 UDP 端口（并尝试持久化 iptables 规则），**密码每次随机
+生成**，安装完成后打印密码与 `hy2://` 导入链接。
+
+```bash
+# 在宿主机上直接使用（不要在容器内安装/卸载）
+sudo bash scripts/hysteria2_setup.sh              # 交互菜单
+sudo bash scripts/hysteria2_setup.sh --install    # 安装/重装（随机密码）
+sudo bash scripts/hysteria2_setup.sh --dry-run --install   # 演练，不写系统
+sudo bash scripts/hysteria2_setup.sh --info       # 查看密码与导入链接
+sudo bash scripts/hysteria2_setup.sh --status     # 运行状态
+sudo bash scripts/hysteria2_setup.sh --uninstall  # 卸载
+
+# 可选：--port 443 --domain bing.com --mask-url https://bing.com/ \
+#       --new-password（强制换随机密码） --keep-password（沿用旧密码）
+```
