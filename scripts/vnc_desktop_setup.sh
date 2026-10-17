@@ -35,12 +35,85 @@ update_variables() {
     SSL_KEY="${SSL_CERT_DIR}/selfsigned.key"
     SSL_CRT="${SSL_CERT_DIR}/selfsigned.crt"
 
-    PKG_LXDE="lxde-core lxterminal lxappearance lxde-icon-theme openbox pcmanfm lxpanel"
-    DBUS_PACKAGE="dbus-x11"
+    # lxpanel / pcmanfm / openbox（连带 lxde-common / lxsession / openbox-lxde-session）
+    # 都是 lxde-core 的硬依赖，会随它一起装上，不必重复列出；
+    # lxterminal 是「切换分辨率」工具双击时用的终端，lxappearance/lxde-icon-theme 是外观件。
+    PKG_LXDE="lxde-core lxterminal lxappearance lxde-icon-theme"
 }
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then echo "❌ 请使用 root 权限运行"; exit 1; fi
+}
+
+# -------------------------------------------------------
+# 通用小工具
+# -------------------------------------------------------
+
+# 索引被 housekeeping_disk 清掉时，装「没装过的包」会报 no installation candidate
+# （装已装的包不受影响）—— 所以真正要装东西前先确认索引还在
+# 注意：/var/lib/apt/lists 下的 partial/、auxfiles/、lock 会一直存在，不能只看目录是否为空
+ensure_apt_lists() {
+    [ -n "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' 2>/dev/null | head -1)" ] && return 0
+    echo "ℹ️ apt 索引已被清理，先补一次 apt update ..."
+    apt update
+}
+
+# 只补装「确实缺失」的包：避免重复 apt install，更避免在 1 核机上白等一次 apt update
+ensure_pkgs() {
+    local need="" p
+    for p in "$@"; do
+        dpkg -s "$p" >/dev/null 2>&1 || need="${need} ${p}"
+    done
+    [ -n "${need}" ] || return 0
+    echo "ℹ️ 补装缺失依赖:${need}"
+    ensure_apt_lists
+    apt install -y --no-install-recommends ${need}
+}
+
+# 会话自启动（幂等：缺哪行补哪行）
+#   @lxpanel/@pcmanfm 起面板与桌面图标，autocutsel×2 做剪贴板双向同步，
+#   @fcitx 起输入法，@xset 关屏保/息屏（防长时间放置黑屏）
+ensure_session_autostart() {
+    local f="${USER_HOME}/.config/lxsession/LXDE/autostart" line
+    mkdir -p "${USER_HOME}/.config/lxsession/LXDE"
+    [ -f "${f}" ] || : > "${f}"
+    while IFS= read -r line; do
+        [ -z "${line}" ] && continue
+        grep -qF "${line}" "${f}" || echo "${line}" >> "${f}"
+    done << 'EOF_AUTOSTART'
+@lxpanel --profile LXDE
+@pcmanfm --desktop --profile LXDE
+@autocutsel -s CLIPBOARD -fork
+@autocutsel -s PRIMARY -fork
+@fcitx
+@xset s off -dpms s noblank
+EOF_AUTOSTART
+    chown ${VNC_USER}:${VNC_USER} "${f}" 2>/dev/null || true
+}
+
+# 磁盘打理：清掉安装期索引缓存 + 给 journald 日志设上限（可反复执行）
+#   /var/lib/apt/lists 装完能到 ~85 MiB（下次 apt update 会自动重下）
+#   journald 默认无上限（最多可吃磁盘 10%），这里固定 64 MiB
+housekeeping_disk() {
+    echo "--- 清理安装缓存与日志 ---"
+
+    local before after
+    before=$(du -sm /var/lib/apt/lists 2>/dev/null | cut -f1); before=${before:-0}
+    rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    apt-get clean 2>/dev/null || true
+    after=$(du -sm /var/lib/apt/lists 2>/dev/null | cut -f1); after=${after:-0}
+    echo "✅ 已清空 apt 索引缓存（释放约 $((before - after)) MiB）"
+
+    local jconf=/etc/systemd/journald.conf.d/99-vps-setup.conf
+    mkdir -p /etc/systemd/journald.conf.d
+    if grep -q '^SystemMaxUse=64M' "${jconf}" 2>/dev/null; then
+        echo "ℹ️ journald 日志上限已是 64M"
+    else
+        printf '[Journal]\nSystemMaxUse=64M\nSystemKeepFree=256M\n' > "${jconf}"
+        systemctl restart systemd-journald 2>/dev/null || true
+        echo "✅ journald 日志上限已设为 64M（${jconf}）"
+    fi
+    journalctl --vacuum-size=64M >/dev/null 2>&1 || true
 }
 
 configure_username() {
@@ -98,15 +171,6 @@ user_has_no_password() {
         P) return 1 ;;   # 已有可用密码
         *) return 0 ;;   # L / NP / 取不到 → 视为没有可用密码
     esac
-}
-
-# 改完密码后回读校验：避免 passwd 被回车空提交/中断，看起来"设过了"其实没写进 shadow
-verify_user_password() {
-    if user_has_no_password; then
-        echo "⚠️  仍未检测到可用密码（可能回车空提交或被中断）。稍后可执行：passwd ${VNC_USER}"
-    else
-        echo "✅ 密码已写入 /etc/shadow，${VNC_USER} 现在可以正常使用 sudo。"
-    fi
 }
 
 # 交互读取两遍密码（不回显）；成功返回 0 并把明文放进 READ_PASS
@@ -399,11 +463,10 @@ EOF_AWK
     fi
     chown -R ${VNC_USER}:${VNC_USER} "${USER_HOME}/.config/lxpanel" 2>/dev/null || true
 
-    # ---- 2) 屏保/息屏长效关闭（写入会话自启动，重启桌面仍生效）----
+    # ---- 2) 会话自启动：面板/桌面图标/剪贴板/输入法/防息屏（幂等补齐）----
     local lx_dir="${USER_HOME}/.config/lxsession/LXDE"
     mkdir -p "${lx_dir}"
-    touch "${lx_dir}/autostart"
-    grep -q "xset s off" "${lx_dir}/autostart" || echo "@xset s off -dpms s noblank" >> "${lx_dir}/autostart"
+    ensure_session_autostart
     chown -R ${VNC_USER}:${VNC_USER} "${lx_dir}" 2>/dev/null || true
 
     # ---- 3) 关闭 lxpolkit（polkit 认证代理），消除「No session for pid N」弹框 ----
@@ -554,7 +617,8 @@ install_lxde_desktop() {
     ensure_desktop_user_and_password
 
     echo "--- 安装 LXDE 桌面核心 ---"
-    apt install -y --no-install-recommends ${PKG_LXDE} ${DBUS_PACKAGE}
+    ensure_apt_lists
+    apt install -y --no-install-recommends ${PKG_LXDE}
     echo "✅ LXDE 桌面核心安装完成（桌面运行用户: ${VNC_USER}）"
 
     # 装完立即加固：屏蔽右下角「注销/屏幕锁」按钮与菜单注销项
@@ -597,7 +661,8 @@ install_edge_browser() {
 
 install_novnc_and_openresty() {
     echo "--- 配置 HTTPS 和 NoVNC ---"
-    apt install -y --no-install-recommends haveged gnupg2 ca-certificates lsb-release
+    # 这几个包 [1] 已装；单独跑本步时才补装（不会重复 apt update）
+    ensure_pkgs haveged gnupg2 ca-certificates lsb-release
 
     mkdir -p /usr/share/keyrings
     wget -qO - https://openresty.org/package/pubkey.gpg | gpg --dearmor --yes -o /usr/share/keyrings/openresty.gpg
@@ -719,11 +784,7 @@ if target in content:
 " 2>/dev/null || true
     fi
 
-    # 彻底禁用 light-locker 屏幕锁与息屏，防止长时间放置后黑屏
-    # （统一由 silence_desktop_bins 处理，幂等，可重复调用）
-    silence_desktop_bins
-
-    echo "✅ noVNC 中文剪贴板双向补丁与防黑屏长效保持已就绪。"
+    echo "✅ noVNC 中文剪贴板双向补丁已就绪。"
 }
 
 # =======================================================
@@ -745,27 +806,13 @@ EOF
         chown -R ${VNC_USER}:${VNC_USER} ${VNC_CONF_DIR}
     fi
 
-    # 确保 LXDE 会话配置及剪贴板/输入法自启动
+    # 确保 LXDE 会话配置（desktop.conf + 会话自启动，自启动统一由 helper 维护）
     local lx_dir="${USER_HOME}/.config/lxsession/LXDE"
     mkdir -p "${lx_dir}"
     if [ ! -f "${lx_dir}/desktop.conf" ] && [ -f /etc/xdg/lxsession/LXDE/desktop.conf ]; then
         cp /etc/xdg/lxsession/LXDE/desktop.conf "${lx_dir}/desktop.conf"
     fi
-    if [ ! -f "${lx_dir}/autostart" ]; then
-        cat > "${lx_dir}/autostart" << 'EOF_AUTO'
-@lxpanel --profile LXDE
-@pcmanfm --desktop --profile LXDE
-@autocutsel -s CLIPBOARD -fork
-@autocutsel -s PRIMARY -fork
-@fcitx
-@xset s off -dpms s noblank
-EOF_AUTO
-    else
-        grep -q "autocutsel -s CLIPBOARD" "${lx_dir}/autostart" || echo "@autocutsel -s CLIPBOARD -fork" >> "${lx_dir}/autostart"
-        grep -q "autocutsel -s PRIMARY" "${lx_dir}/autostart" || echo "@autocutsel -s PRIMARY -fork" >> "${lx_dir}/autostart"
-        grep -q "fcitx" "${lx_dir}/autostart" || echo "@fcitx" >> "${lx_dir}/autostart"
-        grep -q "xset s off" "${lx_dir}/autostart" || echo "@xset s off -dpms s noblank" >> "${lx_dir}/autostart"
-    fi
+    ensure_session_autostart
     chown -R ${VNC_USER}:${VNC_USER} "${USER_HOME}/.config"
 
     # 2. Xvfb 基础帧缓冲显存服务单元 (特定普通用户执行 + 独立日志)
@@ -1095,7 +1142,8 @@ EOF_TOOL
 
 create_edge_tool() {
     echo "--- 生成 Edge 控制工具 ---"
-    apt update && apt install -y --no-install-recommends wmctrl xdotool
+    # wmctrl/xdotool [1] 已装；单独跑本步时才补装（不再白等一次 apt update）
+    ensure_pkgs wmctrl xdotool
     local tool_path="${DESKTOP_DIR}/重置Edge窗口.sh"
 
     cat > "${tool_path}" << 'EOF'
@@ -1211,8 +1259,7 @@ activate_pipeline_services() {
     systemctl enable xvfb@1 vnc-desktop@1 x11vnc@1 websockify@1 vnc-stack@1.target mt5-watchdog@1 2>/dev/null || true
     systemctl restart vnc-stack@1.target
 
-    # 分辨率热切换的免 root 通道（路径单元监听 display-1.conf）
-    install_res_watch_units
+    # 分辨率热切换的免 root 通道（单元模板已由 install_systemd_pipeline_units 写好并 reload）
     systemctl enable vnc-res-watch.path 2>/dev/null || true
     systemctl restart vnc-res-watch.path 2>/dev/null || true
 
@@ -1225,6 +1272,9 @@ activate_pipeline_services() {
     echo "   - mt5-watchdog@1.service (MT5 7*24 自动自愈)"
     echo "   - vnc-res-watch.path     (分辨率热切换：桌面免密码触发)"
     echo "=========================================================="
+
+    # 收尾顺手打理磁盘（清 apt 索引缓存 + 给日志设上限）
+    housekeeping_disk
 }
 
 # -------------------------------------------------------
@@ -1322,6 +1372,7 @@ main_menu() {
         echo " [9] 查看各微服务运行状态 (systemctl)"
         echo " [10] 屏蔽桌面「注销/关机/屏幕锁」(桌面加固)"
         echo " [11] 查看 / 重设 桌面与 VNC 账号密码"
+        echo " [12] 清理安装缓存与日志 (省磁盘)"
         echo " [99] 停止所有服务 (VNC级联与Gost)"
         echo " [0] 退出"
         read -p "选项: " c
@@ -1350,6 +1401,7 @@ main_menu() {
                 systemctl restart vnc-desktop@1 2>/dev/null || true
                 ;;
             11) show_credentials ;;
+            12) housekeeping_disk ;;
             0) exit 0 ;;
         esac
         read -p "按回车继续..."

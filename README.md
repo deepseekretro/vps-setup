@@ -135,3 +135,27 @@ zenity / libwebkit2gtk / ghostscript / imagemagick / gstreamer / mesa-vulkan 等
 （本次改造前，`zenity` 作为 `im-config` / `fcitx-ui-classic` 的推荐包被装入，连带
 `libwebkit2gtk`(90 MiB) / `libjavascriptcoregtk`(31 MiB) / `libflite1`(27 MiB) /
 gstreamer 插件链 —— 同一批依赖在旧安装里实测约 300 MiB。）
+
+**省磁盘：`[12] 清理安装缓存与日志`**（`[6]` 安装激活流水线的收尾也会自动跑一次）：
+
+- 清空 `/var/lib/apt/lists` —— 装完实测 85 MiB（下次 `apt update` 会自动重下）。
+  脚本内的补装逻辑（`ensure_pkgs`）会先看索引是否还在，被清掉时会自动补一次
+  `apt update`，所以不会出现"清完缓存就装不上包"。
+- 给 journald 设上限 `SystemMaxUse=64M`（写 `/etc/systemd/journald.conf.d/99-vps-setup.conf`），
+  避免默认的"最多可吃磁盘 10%"（9.8G 盘 ≈ 近 1 GiB）被日志占掉；并顺手 vacuum 一次。
+  两个动作都是幂等的，重复执行只会提示"已是 64M / 释放约 0 MiB"。
+
+**同样的功能，更少的重复**（本轮去重）：
+
+- `lxde-core` 的硬依赖已包含 `lxpanel` / `pcmanfm` / `openbox`（连带 `lxde-common` /
+  `lxsession` / `openbox-lxde-session`），故安装列表收敛为
+  `lxde-core lxterminal lxappearance lxde-icon-theme`，不再重复列依赖名。
+- 删掉已无调用者的 `verify_user_password()`；`[6]` 路径里 `install_res_watch_units`
+  只调用一次（原来 `install_systemd_pipeline_units` 和 `activate_pipeline_services` 各调一遍，
+  等于把同一批单元文件写两遍再 reload 两次）。
+- `dbus-x11`、`haveged gnupg2 ca-certificates lsb-release`、`wmctrl xdotool` 不再重复
+  apt 安装：改用 `ensure_pkgs` 只补"确实缺失"的包，因此 `[7]` 里那次纯等待的
+  `apt update` 也一并去掉（1 核机器上能省十几秒）。
+- 会话自启动那 6 行（面板 / 桌面图标 / 剪贴板×2 / 输入法 / 防息屏）统一由
+  `ensure_session_autostart` 幂等维护，不再在加固步骤和流水线步骤里各写一遍；
+  noVNC 补丁函数也不再顺手去调 `silence_desktop_bins`（职责错位）。
