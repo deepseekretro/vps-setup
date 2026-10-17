@@ -62,6 +62,10 @@ sudo bash scripts/hysteria2_setup.sh --uninstall  # 卸载
 Xvfb + LXDE + x11vnc + websockify/noVNC + OpenResty(HTTPS)，可选 Wine / Edge / MT5
 自愈守护 / Gost 隧道。各组件由独立 systemd 单元托管（`BindsTo` 强绑定、崩溃自动重启）。
 
+安装 `[2] 安装 LXDE 桌面核心` 时会**再次要求确认「桌面运行用户」**（对应启动时的那次设置），
+并按需幂等创建该用户（补 sudo 组、家目录、`.vnc`/Desktop 目录、`enable-linger`），
+之后 Xvfb / x11vnc / MT5 等单元都会以该用户身份运行。
+
 ```bash
 # 可以在 LXC 容器内运行（推荐），也可以在物理机/独立 VPS 上运行
 sudo bash scripts/vnc_desktop_setup.sh

@@ -60,6 +60,28 @@ configure_username() {
     sleep 1
 }
 
+# 创建/补齐桌面运行用户（幂等：已存在则只补组与目录，不重复要密码）
+create_desktop_user() {
+    if ! id "${VNC_USER}" &>/dev/null; then
+        echo "📁 创建服务用户 ${VNC_USER}..."
+        adduser --disabled-password --gecos "" --home ${USER_HOME} ${VNC_USER}
+        usermod -aG sudo ${VNC_USER}
+
+        echo "📁 正在强制生成英文基础目录..."
+        su - ${VNC_USER} -c "LC_ALL=C xdg-user-dirs-update --force"
+
+        echo "🔑 设置用户 ${VNC_USER} 密码："
+        passwd ${VNC_USER}
+    else
+        echo "ℹ️ 用户 ${VNC_USER} 已存在，跳过创建（仅补齐组与目录）。"
+        usermod -aG sudo ${VNC_USER} 2>/dev/null || true
+    fi
+
+    mkdir -p ${USER_HOME}/Desktop ${USER_HOME}/.vnc ${USER_HOME}/.config/autostart
+    chown -R ${VNC_USER}:${VNC_USER} ${USER_HOME}
+    loginctl enable-linger ${VNC_USER} 2>/dev/null || true
+}
+
 # 检测是否运行在容器内（LXC/Docker/Podman/OpenVZ...），返回类型字符串
 #
 # 为什么容器内绝不能碰 swap：
@@ -164,28 +186,25 @@ setup_system_and_user_and_locale() {
     fi
 
     if [ "$need_create_user" -eq 1 ]; then
-        echo "👤 创建服务用户 ${VNC_USER}..."
-        adduser --disabled-password --gecos "" --home ${USER_HOME} ${VNC_USER}
-        usermod -aG sudo ${VNC_USER}
-
-        echo "📁 正在强制生成英文基础目录..."
-        su - ${VNC_USER} -c "LC_ALL=C xdg-user-dirs-update --force"
-
-        mkdir -p ${USER_HOME}/Desktop ${USER_HOME}/.vnc ${USER_HOME}/.config/autostart
-        chown -R ${VNC_USER}:${VNC_USER} ${USER_HOME}
-
-        echo "🔑 设置用户 ${VNC_USER} 密码："
-        passwd ${VNC_USER}
+        create_desktop_user
     fi
 
     # 启用用户会话永久驻留（防止无 SSH 连接时被系统回收）
-    loginctl enable-linger ${VNC_USER} 2>/dev/null || true
     su - ${VNC_USER} -c "im-config -n fcitx"
     echo "✅ 系统与用户初始化完成。"
 }
 
 install_lxde_desktop() {
+    # 安装桌面核心前，先设置「桌面运行用户」：
+    # LXDE / Xvfb / x11vnc / MT5 全部以该用户身份运行，这里再确认一次，
+    # 并同步刷新 USER_HOME 等派生变量；用户不存在则一并创建（幂等）。
+    echo "--- 0. 设置桌面运行用户 ---"
+    configure_username
+    create_desktop_user
+
+    echo "--- 安装 LXDE 桌面核心 ---"
     apt install -y --no-install-recommends ${PKG_LXDE} ${DBUS_PACKAGE}
+    echo "✅ LXDE 桌面核心安装完成（桌面运行用户: ${VNC_USER}）"
 }
 
 install_wine_env() {
