@@ -60,6 +60,54 @@ configure_username() {
     sleep 1
 }
 
+# 判断账户是否有「可用的」Linux 密码（passwd -S 第二列 = P 才算可用）
+#   L  = 锁定/无密码 —— adduser --disabled-password 建出来的就是这个，sudo 必然认证失败
+#   NP = 无密码
+# 注意：这与 VNC 连接密码（~/.vnc/passwd，由 x11vnc -storepasswd 生成）完全是两回事！
+user_has_no_password() {
+    case "$(passwd -S "${VNC_USER}" 2>/dev/null | awk '{print $2}')" in
+        P) return 1 ;;   # 已有可用密码
+        *) return 0 ;;   # L / NP / 取不到 → 视为没有可用密码
+    esac
+}
+
+# 改完密码后回读校验：避免 passwd 被回车空提交/中断，看起来"设过了"其实没写进 shadow
+verify_user_password() {
+    if user_has_no_password; then
+        echo "⚠️  仍未检测到可用密码（可能回车空提交或被中断）。稍后可执行：passwd ${VNC_USER}"
+    else
+        echo "✅ 密码已写入 /etc/shadow，${VNC_USER} 现在可以正常使用 sudo。"
+    fi
+}
+
+# 账户已存在时也要确认密码真的落地（老版本"已存在就跳过"会把这个坑静默掉）
+ensure_user_password() {
+    if ! id "${VNC_USER}" &>/dev/null; then
+        echo "ℹ️ 用户 ${VNC_USER} 尚不存在，跳过密码检查。"
+        return 0
+    fi
+
+    if user_has_no_password; then
+        echo "========================================"
+        echo "⚠️ 用户 ${VNC_USER} 当前没有可用的 Linux 密码"
+        echo "   （/etc/shadow 为 ! 状态 → sudo 一定认证失败；"
+        echo "     它和 VNC 连接密码 ~/.vnc/passwd 不是一回事）"
+        echo "========================================"
+        read -p "现在为 ${VNC_USER} 设置 Linux 密码？[y/N]: " setpw
+        case "${setpw}" in
+            [yY]*)
+                passwd "${VNC_USER}"
+                verify_user_password
+                ;;
+            *)
+                echo "ℹ️ 已跳过。之后可随时执行：passwd ${VNC_USER}"
+                ;;
+        esac
+    else
+        echo "✅ 用户 ${VNC_USER} 已有可用的 Linux 密码（可用于 sudo）。"
+    fi
+}
+
 # 创建/补齐桌面运行用户（幂等：已存在则只补组与目录，不重复要密码）
 create_desktop_user() {
     if ! id "${VNC_USER}" &>/dev/null; then
@@ -72,9 +120,11 @@ create_desktop_user() {
 
         echo "🔑 设置用户 ${VNC_USER} 密码："
         passwd ${VNC_USER}
+        verify_user_password
     else
         echo "ℹ️ 用户 ${VNC_USER} 已存在，跳过创建（仅补齐组与目录）。"
         usermod -aG sudo ${VNC_USER} 2>/dev/null || true
+        ensure_user_password
     fi
 
     mkdir -p ${USER_HOME}/Desktop ${USER_HOME}/.vnc ${USER_HOME}/.config/autostart
@@ -316,6 +366,8 @@ setup_system_and_user_and_locale() {
                 echo "ℹ️ 已选择保留现有用户 ${VNC_USER} 及全部数据。"
                 usermod -aG sudo ${VNC_USER}
                 need_create_user=0
+                # 保留现有用户时 create_desktop_user 不会被调用，这里单独补一次密码检查
+                ensure_user_password
                 ;;
         esac
     fi

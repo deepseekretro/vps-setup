@@ -67,6 +67,19 @@ Xvfb + LXDE + x11vnc + websockify/noVNC + OpenResty(HTTPS)，可选 Wine / Edge 
 `enable-linger`）；其余步骤（Wine/Edge/HTTPS/服务单元等）沿用最近一次设置的用户，
 Xvfb / x11vnc / MT5 等单元都会以该用户身份运行。
 
+**两个密码不是一回事**（很容易搞混）：
+
+| 密码 | 提示位置 | 存放 | 用途 |
+|---|---|---|---|
+| Linux 账户密码 | `🔑 设置用户 xxx 密码：`（`passwd`） | `/etc/shadow` | `sudo`、`su` 认证 |
+| VNC 连接密码 | `--- 配置 VNC 密码与启动级联服务 ---`（`x11vnc -storepasswd`） | `~/.vnc/passwd` | 登录远程桌面时输入 |
+
+`adduser --disabled-password` 建出来的账户在 `/etc/shadow` 里是 `!`（锁定、无密码），
+此时**该用户永远无法使用 sudo**（输 VNC 连接密码也没用）。因此脚本会回读校验
+（`passwd -S` 第二列须为 `P`），并且**用户已存在时也会检查**：一旦发现没有可用密码，
+就明确提示并询问是否现在补设（不会像以前那样"已存在就整段跳过"而把坑静默掉）。
+事后也可随时手动执行 `passwd <用户名>` 修改。
+
 ```bash
 # 可以在 LXC 容器内运行（推荐），也可以在物理机/独立 VPS 上运行
 sudo bash scripts/vnc_desktop_setup.sh
