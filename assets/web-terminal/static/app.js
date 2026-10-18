@@ -396,7 +396,10 @@
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
     var everOpened = false;
-    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    // ws 基址跟随页面所在目录: 子目录部署(如 /terminal/)时连 /terminal/ws,
+    // 根路径部署时 base 恰为 '/',保持原有行为。
+    var base = location.pathname.replace(/[^/]*$/, '');
+    ws = new WebSocket(proto + '://' + location.host + base + 'ws');
 
     ws.onopen = function () {
       everOpened = true;
