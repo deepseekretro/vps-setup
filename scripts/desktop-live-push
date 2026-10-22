@@ -1,0 +1,106 @@
+#!/bin/bash
+# 第二屏 → YouTube RTMP 推流（最小成本路径）
+#
+# 不重新编码 1080p 视频：直接复用 MediaMTX 的 desktop_av H.264，
+# 只把 Opus 音频转成 AAC，然后推 RTMP。
+#
+# 前置条件：
+#   - 第二屏已经打开：主屏在右 1920,0，第二屏在左 0,0
+#   - /etc/default/desktop-live 里已填 RTMP_URL 或 YOUTUBE_STREAM_KEY
+#
+# 用法：
+#   systemctl start desktop-live-push
+#   systemctl stop desktop-live-push
+#   journalctl -u desktop-live-push -f
+set -u
+
+ENV_FILE="${DESKTOP_LIVE_ENV:-/etc/default/desktop-live}"
+if [ -r "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+log() { echo "[desktop-live-push] $*"; }
+
+# 过滤 ffmpeg stderr，避免连接错误把 YouTube 密钥写进 journal。
+redact_key() {
+    local key="${YOUTUBE_STREAM_KEY:-}"
+    if [ -z "$key" ] && [[ "$TARGET" == *"/live2/"* ]]; then
+        key="${TARGET##*/live2/}"
+    fi
+    STREAM_KEY="$key" python3 -c '
+import os, sys
+key = os.environ.get("STREAM_KEY", "")
+for line in sys.stdin:
+    if key:
+        line = line.replace(key, "***")
+    sys.stdout.write(line)
+    sys.stdout.flush()
+'
+}
+
+TARGET="${RTMP_URL:-}"
+if [ -z "$TARGET" ] && [ -n "${YOUTUBE_STREAM_KEY:-}" ]; then
+    BASE="${YOUTUBE_RTMP_BASE:-rtmp://a.rtmp.youtube.com/live2}"
+    TARGET="${BASE%/}/${YOUTUBE_STREAM_KEY}"
+fi
+
+if [ -z "$TARGET" ]; then
+    log "未配置 RTMP_URL 或 YOUTUBE_STREAM_KEY；不启动推流"
+    exit 0
+fi
+
+RTSP="${LIVE_RTSP_URL:-rtsp://127.0.0.1:8554/desktop_av}"
+AUDIO_BITRATE="${LIVE_AUDIO_BITRATE:-192k}"
+
+# 只推“第二屏”：要求 screen2ctl 处于扩展状态，并且第二屏在默认左侧 0,0。
+# 这样不会误把主屏/控制屏推出去。
+state_ok() {
+    local state
+    state="$(curl -fsS --max-time 3 http://127.0.0.1:6090/state 2>/dev/null || true)"
+    [ -n "$state" ] || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(2)
+sec = s.get("secondary") or {}
+if not s.get("extended") or not sec:
+    sys.exit(1)
+if sec.get("x") != 0 or sec.get("y") != 0:
+    sys.exit(3)
+' "$state"
+}
+
+if ! state_ok; then
+    log "第二屏未打开，或不在默认左侧 0,0；不启动推流"
+    exit 0
+fi
+
+safe_target=$(printf '%s' "$TARGET" | sed -E 's#(live2/).*#\1***#')
+log "启动：$RTSP → $safe_target（视频 copy，音频 AAC ${AUDIO_BITRATE}）"
+
+ffmpeg -hide_banner -nostdin -loglevel warning \
+    -rtsp_transport tcp -i "$RTSP" \
+    -map 0:v:0 -map 0:a:0? \
+    -c:v copy \
+    -c:a aac -b:a "$AUDIO_BITRATE" -ar 48000 \
+    -max_muxing_queue_size 1024 \
+    -f flv "$TARGET" 2> >(redact_key >&2) &
+pid=$!
+
+trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 0' INT TERM
+
+# 第二屏关闭或布局改变时，立刻停推流，避免把主屏推出去。
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 10
+    if ! state_ok; then
+        log "第二屏已关闭或布局改变，停止推流"
+        kill -TERM "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        exit 0
+    fi
+done
+
+wait "$pid"

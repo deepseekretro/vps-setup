@@ -1,0 +1,5 @@
+#!/bin/sh
+# RTC 通道专用的 TigerVNC（端口 5903）。
+# 与 x11vnc / WS 通道完全独立：只读同一个 X display。
+# 具体版本选择与几何逻辑见 /usr/local/bin/x0vnc-view。
+exec /usr/local/bin/x0vnc-view 5903 /etc/vnc-rtc/x0vnc-geometry vncuser1-rtc

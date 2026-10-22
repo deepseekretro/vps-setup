@@ -1,0 +1,22 @@
+[Unit]
+Description=Push second screen to YouTube RTMP (H264 copy + AAC)
+Documentation=file:///root/vps-setup/scripts/desktop-live-push
+After=network-online.target mediamtx.service
+Wants=network-online.target mediamtx.service
+
+[Service]
+Type=simple
+User=vncuser1
+Group=vncuser1
+Environment=DISPLAY=:1
+Environment=XDG_RUNTIME_DIR=/run/pulse-vnc
+Environment=PULSE_SERVER=unix:/run/pulse-vnc/pulse/native
+Environment=DESKTOP_LIVE_ENV=/etc/default/desktop-live
+ExecStart=/usr/local/bin/desktop-live-push
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,169 @@
+#!/bin/bash
+# 一键启动/停止第二屏 YouTube 直播。
+#
+# 用法：
+#   youtube-live            # 立即启动（默认）
+#   youtube-live start
+#   youtube-live status
+#   youtube-live stop
+#
+# 默认行为：
+#   - 确保第二屏打开，主屏右 / 第二屏左
+#   - 保持第二屏不因 30 秒无心跳自动收起
+#   - 重启 desktop-live-push，连接 YouTube RTMPS 443
+#   - 自动停掉本地 RTMP 预览，避免和正式推流混在一起
+#
+# 密钥配置在 /etc/default/desktop-live；本脚本不会打印密钥。
+set -u
+
+CONF="/etc/default/desktop-live"
+PUSH_UNIT="desktop-live-push.service"
+HOLD_UNIT="screen2-stream-hold.service"
+STATE_URL="http://127.0.0.1:6090/state"
+
+log() { echo "[youtube-live] $*"; }
+die() { echo "[youtube-live] ERROR: $*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo youtube-live"
+
+state_json() {
+    curl -fsS --max-time 3 "$STATE_URL" 2>/dev/null || true
+}
+
+state_ok_left() {
+    [ -n "${1:-}" ] || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(2)
+sec = s.get("secondary") or {}
+sys.exit(0 if s.get("extended") and sec.get("x") == 0 and sec.get("y") == 0 else 1)
+' "$1"
+}
+
+state_is_extended() {
+    [ -n "${1:-}" ] || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(2)
+sys.exit(0 if s.get("extended") else 1)
+' "$1"
+}
+
+ensure_second_screen() {
+    systemctl start screen2ctl.service >/dev/null 2>&1 || true
+
+    local state
+    state="$(state_json)"
+    if state_ok_left "$state"; then
+        log "第二屏已打开：主屏右 / 第二屏左"
+        return 0
+    fi
+
+    if state_is_extended "$state"; then
+        die "第二屏已扩展，但不在默认左侧 0,0；当前布局不是推流脚本支持的布局"
+    fi
+
+    log "第二屏未打开，正在扩展桌面..."
+    curl -fsS -X POST "http://127.0.0.1:6090/open" >/dev/null 2>&1 || true
+
+    for _ in $(seq 1 20); do
+        sleep 1
+        state="$(state_json)"
+        if state_ok_left "$state"; then
+            log "第二屏已打开：主屏右 / 第二屏左"
+            return 0
+        fi
+    done
+
+    die "第二屏没有成功打开；检查 journalctl -u screen2ctl"
+}
+
+start_live() {
+    [ -r "$CONF" ] || die "找不到 $CONF"
+    if ! grep -Eq '^(RTMP_URL|YOUTUBE_STREAM_KEY)=[^[:space:]]+' "$CONF"; then
+        die "$CONF 里没有 RTMP_URL 或 YOUTUBE_STREAM_KEY"
+    fi
+
+    ensure_second_screen
+
+    # 保持第二屏；否则 screen2ctl 会在 30 秒无心跳后自动收起。
+    systemctl start "$HOLD_UNIT" >/dev/null 2>&1 || die "无法启动 $HOLD_UNIT"
+    systemctl is-active --quiet "$HOLD_UNIT" || die "$HOLD_UNIT 没有运行"
+
+    # 停掉本地预览，避免误把 preview 和正式推流同时开着。
+    systemctl stop rtmp-preview-player.service desktop-live-preview.service >/dev/null 2>&1 || true
+
+    systemctl start mediamtx.service >/dev/null 2>&1 || die "无法启动 MediaMTX"
+
+    log "重启 YouTube 推流..."
+    systemctl reset-failed "$PUSH_UNIT" >/dev/null 2>&1 || true
+    systemctl restart "$PUSH_UNIT" || die "无法启动 $PUSH_UNIT"
+
+    # 等待进程稳定并出现到 YouTube 的 443 连接。
+    for _ in $(seq 1 20); do
+        sleep 1
+        if systemctl is-active --quiet "$PUSH_UNIT"; then
+            if ss -tnp 2>/dev/null | grep ':443' | grep -q 'ffmpeg'; then
+                log "YouTube 推流已启动（RTMPS 443）"
+                log "第二屏：左侧 1920x1080；主屏：右侧"
+                log "查看状态：youtube-live status"
+                log "停止：youtube-live stop"
+                return 0
+            fi
+        fi
+    done
+
+    # 进程还在但连接还没出现时，给它最后一次机会；否则报错。
+    if systemctl is-active --quiet "$PUSH_UNIT"; then
+        log "服务已启动，但暂时没看到 ffmpeg 的 443 连接；请用 youtube-live status 或 journalctl 检查"
+        return 0
+    fi
+
+    die "推流没有启动；检查 journalctl -u $PUSH_UNIT -n 50 --no-pager"
+}
+
+stop_live() {
+    systemctl stop "$PUSH_UNIT" "$HOLD_UNIT" >/dev/null 2>&1 || true
+    curl -fsS -X POST "http://127.0.0.1:6090/close" >/dev/null 2>&1 || true
+    log "YouTube 推流和第二屏保持已停止；第二屏将收起"
+}
+
+show_status() {
+    printf '  %-28s ' "desktop-live-push"
+    systemctl is-active "$PUSH_UNIT" 2>/dev/null || true
+    printf '  %-28s ' "screen2-stream-hold"
+    systemctl is-active "$HOLD_UNIT" 2>/dev/null || true
+    printf '  %-28s ' "mediamtx"
+    systemctl is-active mediamtx.service 2>/dev/null || true
+
+    local state
+    state="$(state_json)"
+    if [ -n "$state" ]; then
+        python3 -c '
+import json, sys
+s = json.loads(sys.argv[1])
+print("  第二屏：extended=%s primary=%s secondary=%s" % (s.get("extended"), s.get("primary"), s.get("secondary")))
+' "$state" 2>/dev/null || true
+    else
+        echo "  第二屏：无法读取 screen2ctl 状态"
+    fi
+
+    if ss -tnp 2>/dev/null | grep ':443' | grep -q 'ffmpeg'; then
+        echo "  YouTube：ffmpeg 到 443 的连接存在"
+    else
+        echo "  YouTube：未看到 ffmpeg 的 443 连接"
+    fi
+}
+
+case "${1:-start}" in
+    start) start_live ;;
+    stop) stop_live ;;
+    status|state) show_status ;;
+    *) echo "用法：youtube-live [start|stop|status]" >&2; exit 2 ;;
+esac

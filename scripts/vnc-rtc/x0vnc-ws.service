@@ -1,0 +1,15 @@
+[Unit]
+Description=TigerVNC scraping server for the WebSocket channel (port 5901)
+After=vnc-desktop@1.service
+Wants=vnc-desktop@1.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+ExecStart=/usr/local/bin/x0vnc-ws-main
+Restart=always
+RestartSec=2
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

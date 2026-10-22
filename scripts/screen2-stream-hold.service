@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep noVNC second screen open for YouTube live
+Documentation=file:///root/vps-setup/scripts/youtube-live
+After=screen2ctl.service
+Wants=screen2ctl.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'while :; do curl -fsS --max-time 2 -X POST http://127.0.0.1:6090/ping >/dev/null 2>&1 || true; sleep 10; done'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+#!/bin/sh
+# /new_vnc 第二块屏的 TigerVNC（端口 5902），由 screen2ctl 按需启动。
+exec /usr/local/bin/x0vnc-view 5902 /etc/vnc-ws/second-geometry vncuser1-2

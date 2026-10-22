@@ -1,0 +1,31 @@
+#!/bin/bash
+# 桌面声音 -> 本机 WebRTC 发送器（vnc-audio-rtc）的 ffmpeg 编码端。
+# 仅 AUDIO_BACKEND=ffmpeg 时使用；由 vnc-audio-rtc 按需拉起，
+# 有听众才编码，最后一个听众离开几秒后停。
+# 与 MediaMTX 那条（desktop-audio-publish）互不影响，后者只给 /whep-av 用。
+set -u
+
+ENV_FILE="${DESKTOP_AUDIO_ENV:-/etc/default/desktop-audio}"
+if [ -r "${ENV_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${ENV_FILE}"
+fi
+
+SRC="${DESKTOP_AUDIO_SRC:-virtual_speaker.monitor}"
+BITRATE="${DESKTOP_AUDIO_BITRATE:-192k}"
+RTP_URL="${DESKTOP_AUDIO_RTP:-rtp://127.0.0.1:8195}"
+
+echo "[desktop-audio-rtc-publish] ${SRC} -> ${RTP_URL} (Opus ${BITRATE}, 10ms, RTP/UDP)"
+# 参数对齐 Selkies：--audio-bitrate=192000 --audio-frame-duration-ms=10。
+# 编码模式用 libopus 默认的 application=audio（音乐/桌面声音更稳，不用 lowdelay）。
+# asetpts=N/SR/TB：PulseAudio 包时间戳会抖/倒退，libopus 会因此丢帧；
+# 按采样计数重建时间戳后 RTP 时间戳就是稳定的 10ms 步进（48k 下为 480）。
+# -fragment_size 1920：48k/s16/立体声下正好 10ms 一块，编码器一帧一包，
+# 不会像默认约 50ms 一块那样一次吐出好几帧、RTP 成串到达。
+# 这里是 UDP 单包直发，没有 RTSP/TCP 合包，也不会被 MediaMTX 二次转发。
+exec ffmpeg -hide_banner -nostdin -loglevel warning \
+    -f pulse -fragment_size 1920 -i "${SRC}" \
+    -af asetpts=N/SR/TB \
+    -ac 2 -ar 48000 \
+    -c:a libopus -b:a "${BITRATE}" -application audio -frame_duration 10 \
+    -f rtp -payload_type 111 "${RTP_URL}"

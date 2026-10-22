@@ -1,0 +1,12 @@
+[Unit]
+Description=TigerVNC second-screen server for the WebSocket channel (port 5902, on demand)
+After=vnc-desktop@1.service x0vnc-ws.service
+Wants=vnc-desktop@1.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+ExecStart=/usr/local/bin/x0vnc-ws-second
+Restart=always
+RestartSec=2
+LimitNOFILE=4096

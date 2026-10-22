@@ -1,0 +1,31 @@
+#!/bin/sh
+# 通用 TigerVNC 抓屏实例入口：x0vnc-view <端口> <几何文件> <桌面名>
+#
+# 与 x11vnc 通道完全独立，只读同一个 X display。几何在启动时定死，
+# 改几何 = 改文件 + 重启对应 unit（screen2ctl 负责）。
+#
+# 必须 >= 1.15：1.12（Debian 12 自带）没有剪贴板重定向。
+#
+# -AcceptSetDesktopSize=0 是硬要求：TigerVNC 默认允许客户端改桌面尺寸，
+# 第二块屏的浏览器一缩放就会发 SetDesktopSize，把 X 根窗口改掉，
+# 首屏（5901）/RTC（5903）的裁剪几何立刻失效 → 花屏/黑块。
+# 布局只由 screen2ctl 管，客户端不许改。
+# 二进制定在 /opt/tigervnc-<ver>/bin/x0vncserver，由安装脚本下载。
+PORT=$1
+GEOMFILE=$2
+NAME=$3
+GEOM=$(cat "$GEOMFILE" 2>/dev/null || true)
+for BIN in /opt/tigervnc-1.16.2/bin/x0vncserver \
+           /opt/tigervnc-1.15/bin/x0vncserver \
+           /usr/bin/X0tigervnc; do
+    [ -x "$BIN" ] && break
+done
+exec "$BIN" \
+    -display :1 \
+    -rfbport "$PORT" \
+    -rfbauth /home/vncuser1/.vnc/passwd \
+    -AlwaysShared \
+    -FrameRate 30 \
+    -AcceptSetDesktopSize=0 \
+    -desktop "$NAME" \
+    ${GEOM:+-Geometry "$GEOM"}

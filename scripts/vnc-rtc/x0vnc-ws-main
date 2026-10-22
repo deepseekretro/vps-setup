@@ -1,0 +1,4 @@
+#!/bin/sh
+# /new_vnc（WebSocket 通道）主视图的 TigerVNC（端口 5901）。
+# 几何由 screen2ctl 写 /etc/vnc-ws/main-geometry 并重启本 unit。
+exec /usr/local/bin/x0vnc-view 5901 /etc/vnc-ws/main-geometry vncuser1
